@@ -7,28 +7,11 @@ from pydantic_settings import BaseSettings
 
 class Base(BaseModel):
     """
-    所有渠道配置的基类：
+    所有配置的基类：
     1. 统一配置模型的行为：支持驼峰/下划线两种键名
-    2. 后续所有渠道配置类都继承此类，无需重复写配置规则
+    2. 后续所有配置类都继承此类，无需重复写配置规则
     """
     model_config = ConfigDict(alias_generator=to_camel,populate_by_name=True)
-
-
-class QQConfig(Base):
-    """使用 botpy SDK 进行的 QQ 频道配置"""
-
-    enabled: bool = False
-    app_id: str = ""
-    secret: str = ""
-    allow_from: list[str] = Field(default_factory=list)
-
-
-class ChannelsConfig(Base):
-    """聊天频道总配置"""
-
-    send_progress: bool = True          # agent是否发送处理进度到聊天室
-    send_tool_hints: bool = True       # agent是否发送调用了哪些工具到聊天室
-    qq: QQConfig = Field(default_factory=QQConfig)
 
 
 class AgentDefaults(Base):
@@ -38,7 +21,7 @@ class AgentDefaults(Base):
     model: str = "anthropic/claude-opus-4-5"   # 必须是供应商/模型名称
     # LLM提供商（auto=自动匹配；也可指定anthropic/openrouter等）
     provider: str = (
-        "auto"  
+        "auto"
     )
     # AI回答的最大令牌数（8192≈6000中文字符，限制回答长度，防止超长回复）
     max_tokens: int = 8192
@@ -49,8 +32,7 @@ class AgentDefaults(Base):
     # 记忆窗口大小（AI能记住的对话轮数，100表示能记住最近100轮对话）
     memory_window: int = 100
     # 推理强度（low/medium/high，控制AI思考的深度，None=使用模型默认）
-    reasoning_effort: str | None = None  
-    
+    reasoning_effort: str | None = None
 
 
 class AgentsConfig(Base):
@@ -78,27 +60,6 @@ class ProvidersConfig(Base):
     deepseek: ProviderConfig = Field(default_factory=ProviderConfig)
     dashscope: ProviderConfig = Field(default_factory=ProviderConfig)  # 阿里云通义千问
     siliconflow: ProviderConfig = Field(default_factory=ProviderConfig)  # 硅基流动
-
-
-class HeartbeatConfig(Base):
-    """
-    心跳服务配置
-    核心作用：定期检查nanobot是否存活，防止服务挂掉无感知
-    """
-    enabled: bool = True  # 是否启用心跳（默认开启）
-    interval_s: int = 30 * 60  # 心跳检查间隔（30分钟，单位：秒）
-
-
-
-class GatewayConfig(Base):
-    """
-    网关/服务器配置
-    核心作用：定义nanobot后台服务的监听地址和端口，以及心跳配置
-    """
-    host: str = "0.0.0.0"                                                # 监听地址（0.0.0.0表示监听本机所有网卡，外网/内网都能访问）
-    port: int = 18790                                                    # 监听端口（默认18790，可自定义）
-    heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)  # 心跳服务配置
-
 
 
 class WebSearchConfig(Base):
@@ -166,9 +127,7 @@ class Config(BaseSettings):
     核心作用：汇总所有子配置，提供获取LLM提供商、API密钥等实用方法
     """
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
-    channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
-    gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
 
     @property
@@ -189,7 +148,7 @@ class Config(BaseSettings):
         if forced != "auto":
             p = getattr(self.providers,forced,None)
             return (p,forced) if p else (None,None)
-        
+
         # 模型前缀匹配
         model_prefix = model.split("/",1)[0]
         for spec in PROVIDERS:
@@ -198,27 +157,9 @@ class Config(BaseSettings):
                 return p,model_prefix
 
         return None,None
-    
-    
+
+
     model_config = ConfigDict(
         env_prefix="NANOBOT_",  # 环境变量前缀（如NANOBOT_AGENTS__DEFAULTS__MODEL）
         env_nested_delimiter="__"  # 嵌套配置的分隔符（AgentsConfig.defaults.model → AGENTS__DEFAULTS__MODEL）
     )
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

@@ -258,12 +258,10 @@ def gateway(
     # ===================== 第二步：导入核心模块（延迟导入提升启动速度） =====================
     from nanobot.agent.loop import AgentLoop      # 核心Agent循环：处理LLM推理、工具调用、会话逻辑
     from nanobot.bus.queue import MessageBus      # 消息总线：模块间通信的核心（解耦组件）
-    from nanobot.channels.manager import ChannelManager  # 通道管理器：管理Telegram/WhatsApp等通信通道
     from nanobot.config.loader import load_config  # 加载配置文件
     from nanobot.config.paths import get_cron_dir  # 获取定时任务数据目录
     from nanobot.cron.service import CronService   # 定时任务服务：管理/执行定时任务
     from nanobot.cron.types import CronJob         # 定时任务数据模型
-    from nanobot.heartbeat.service import HeartbeatService  # 心跳服务：定期执行预设任务并推送通知
     from nanobot.session.manager import SessionManager      # 会话管理器：管理用户会话状态
 
     # ===================== 第三步：配置日志（详细模式） =====================
@@ -310,7 +308,6 @@ def gateway(
         restrict_to_workspace=config.tools.restrict_to_workspace,  # 限制工具仅操作工作区（安全）
         session_manager=session_manager,  # 关联会话管理器
         mcp_servers=config.tools.mcp_servers,  # MCP服务器配置（模型控制协议）
-        channels_config=config.channels,  # 通道配置（Telegram/WhatsApp等）
     )
 
     # ===================== 第七步：设置定时任务回调（Cron任务执行逻辑） =====================
@@ -318,7 +315,6 @@ def gateway(
     async def on_cron_job(job: CronJob) -> str | None:
         """Execute a cron job through the agent.（通过Agent执行定时任务）"""
         from nanobot.agent.tools.cron import CronTool
-        from nanobot.agent.tools.message import MessageTool
         # 构造定时任务的提示词：告知Agent这是定时任务触发
         reminder_note = (
             "[Scheduled Task] Timer finished.\n\n"
@@ -345,129 +341,34 @@ def gateway(
             if isinstance(cron_tool, CronTool) and cron_token is not None:
                 cron_tool.reset_cron_context(cron_token)
 
-        # 检查消息工具是否已发送过响应（避免重复推送）
-        message_tool = agent.tools.get("message")
-        if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
-            return response
-
         # 如果任务配置了推送目标：将执行结果推送到指定通道/聊天ID
         if job.payload.deliver and job.payload.to and response:
-            from nanobot.bus.events import OutboundMessage
-            await bus.publish_outbound(OutboundMessage(
-                channel=job.payload.channel or "cli",
-                chat_id=job.payload.to,
-                content=response
-            ))
+            # 直接打印响应（无消息总线推送）
+            console.print(f"[dim]Cron result: {response[:100]}...[/dim]" if len(response) > 100 else f"[dim]Cron result: {response}[/dim]")
         return response
     # 将回调函数绑定到定时任务服务（触发任务时执行）
     cron.on_job = on_cron_job
 
-    # ===================== 第八步：初始化通道管理器（多通道通信） =====================
-    # 通道管理器：负责启动/管理Telegram/WhatsApp等外部通信通道
-    channels = ChannelManager(config, bus)
-
-    # 辅助函数：选择心跳任务的推送目标（优先非CLI的活跃通道）
-    def _pick_heartbeat_target() -> tuple[str, str]:
-        """Pick a routable channel/chat target for heartbeat-triggered messages.（选择心跳消息的推送目标）"""
-        # 获取已启用的通道列表
-        enabled = set(channels.enabled_channels)
-        # 优先选择：已启用通道中最近更新的非内部会话（排除cli/system）
-        for item in session_manager.list_sessions():
-            key = item.get("key") or ""
-            if ":" not in key:
-                continue
-            channel, chat_id = key.split(":", 1)
-            # 跳过CLI/系统通道，选择用户交互的通道（如Telegram）
-            if channel in {"cli", "system"}:
-                continue
-            if channel in enabled and chat_id:
-                return channel, chat_id
-        # 兜底：无可用外部通道时，使用CLI（不推送）
-        return "cli", "direct"
-
-    # ===================== 第九步：初始化心跳服务（定期执行任务） =====================
-    # 心跳任务执行回调：通过Agent执行心跳预设任务
-    async def on_heartbeat_execute(tasks: str) -> str:
-        """Phase 2: execute heartbeat tasks through the full agent loop.（执行心跳任务）"""
-        # 选择心跳消息的推送目标通道/聊天ID
-        channel, chat_id = _pick_heartbeat_target()
-
-        # 静默进度回调：心跳任务不输出进度日志
-        async def _silent(*_args, **_kwargs):
-            pass
-
-        # 通过Agent执行心跳任务（后台静默执行）
-        return await agent.process_direct(
-            tasks,
-            session_key="heartbeat",  # 专属心跳会话Key
-            channel=channel,
-            chat_id=chat_id,
-            on_progress=_silent,  # 禁用进度回调
-        )
-
-    # 心跳结果通知回调：将心跳任务结果推送到用户通道
-    async def on_heartbeat_notify(response: str) -> None:
-        """Deliver a heartbeat response to the user's channel.（推送心跳任务结果）"""
-        from nanobot.bus.events import OutboundMessage
-        # 选择推送目标
-        channel, chat_id = _pick_heartbeat_target()
-        # CLI通道不推送（无外部用户）
-        if channel == "cli":
-            return
-        # 发布出站消息：推送到指定通道/聊天ID
-        await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=response))
-
-    # 从配置中获取心跳服务配置
-    hb_cfg = config.gateway.heartbeat
-    # 创建心跳服务实例
-    heartbeat = HeartbeatService(
-        workspace=config.workspace_path,  # 工作区路径（存储心跳任务配置）
-        provider=provider,  # LLM提供商（解析心跳任务指令）
-        model=agent.model,  # 使用Agent的默认模型
-        on_execute=on_heartbeat_execute,  # 心跳任务执行回调
-        on_notify=on_heartbeat_notify,  # 心跳结果通知回调
-        interval_s=hb_cfg.interval_s,  # 心跳间隔（秒）
-        enabled=hb_cfg.enabled,  # 是否启用心跳服务
-    )
-
-    # ===================== 第十步：打印启动状态（用户可见的汇总信息） =====================
-    # 打印已启用的通道
-    if channels.enabled_channels:
-        console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
-    else:
-        console.print("[yellow]Warning: No channels enabled[/yellow]")
-
+    # ===================== 第八步：打印启动状态（用户可见的汇总信息） =====================
     # 打印定时任务数量
     cron_status = cron.status()
     if cron_status["jobs"] > 0:
         console.print(f"[green]✓[/green] Cron: {cron_status['jobs']} scheduled jobs")
 
-    # 打印心跳服务状态
-    console.print(f"[green]✓[/green] Heartbeat: every {hb_cfg.interval_s}s")
-
-    # ===================== 第十一步：异步启动所有服务（核心运行逻辑） =====================
+    # ===================== 第九步：异步启动所有服务（核心运行逻辑） =====================
     async def run():
         try:
             # 启动定时任务服务
             await cron.start()
-            # 启动心跳服务
-            await heartbeat.start()
-            # 并发启动核心服务：
-            # - agent.run()：启动Agent核心循环（处理推理、工具调用）
-            # - channels.start_all()：启动所有已启用的通信通道
-            await asyncio.gather(
-                agent.run(),
-                channels.start_all(),
-            )
+            # 启动Agent核心循环
+            await agent.run()
         except KeyboardInterrupt:  # 捕获Ctrl+C中断
             console.print("\nShutting down...")
         finally:
             # 优雅关闭所有服务（释放资源）
             await agent.close_mcp()  # 关闭MCP服务器连接
-            heartbeat.stop()  # 停止心跳服务
             cron.stop()  # 停止定时任务服务
             agent.stop()  # 停止Agent循环
-            await channels.stop_all()  # 停止所有通信通道
 
     # 启动异步运行循环（阻塞直到服务停止）
     asyncio.run(run())
@@ -531,7 +432,6 @@ def agent(
         cron_service=cron,                                          # 绑定定时任务服务
         restrict_to_workspace=config.tools.restrict_to_workspace,   # 是否限制只能操作工作区（安全）
         mcp_servers=config.tools.mcp_servers,                       # MCP 服务配置
-        channels_config=config.channels,                            # 通道配置
     )
 
     # ===================== 3. UI 交互：思考中动画 & 进度提示 =====================
@@ -546,12 +446,6 @@ def agent(
 
     # AI 进度回调：比如 "正在搜索..." "正在执行命令..." 这种灰色小字提示
     async def _cli_progress(content: str, *, tool_hint: bool = False) -> None:
-        ch = agent_loop.channels_config
-        # 根据配置判断要不要显示工具提示/进度
-        if not ch.send_tool_hints or not tool_hint:
-            return
-        if not ch.send_progress:
-            return
         # 终端输出灰色小字：↳ xxx
         console.print(f"[dim]↳{content}[/dim]")
 
@@ -620,16 +514,9 @@ def agent(
                     try:
                         # 每隔1秒轮询一次AI的输出
                         msg = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
-                        # 如果是进度消息（如“正在搜索”）
-                        if msg.metadata.get("_progress"):
-                            is_tool_hint = msg.metadata.get("_tool_hint", False)
-                            ch = agent_loop.channels_config
-                            if ch and is_tool_hint and not ch.send_tool_hints:
-                                pass
-                            elif ch and not is_tool_hint and not ch.send_progress:
-                                pass
-                            else:
-                                console.print(f"  [dim]↳ {msg.content}[/dim]")
+                        # 如果是进度消息（如”正在搜索”）
+                        if msg.metadata.get(“_progress”):
+                            console.print(f”  [dim]↳ {msg.content}[/dim]”)
                         # 如果是正式回答
                         elif not turn_done.is_set():
                             if msg.content:
@@ -706,99 +593,6 @@ def agent(
         asyncio.run(run_interactive())
 
 
-
-# ============================================================================
-# Channel 通道管理命令组
-# ============================================================================
-# 创建子命令：channels，用于管理消息通道
-channels_app = typer.Typer(help="Manage channels")
-# 将子命令注册到主应用
-app.add_typer(channels_app, name="channels")
-
-
-@channels_app.command("status")
-def channels_status():
-    """查看所有消息通道的启用状态（CLI/WhatsApp/Web等）"""
-    # 延迟导入：避免循环依赖，仅执行命令时加载
-    from nanobot.channels.registry import discover_all
-    from nanobot.config.loader import load_config
-
-    # 加载系统配置
-    config = load_config()
-    # 创建富文本表格
-    table = Table(title="Channel Status")
-    table.add_column("Channel", style="cyan")
-    table.add_column("Enabled", style="green")
-
-    # 遍历所有发现的通道类
-    for name, cls in sorted(discover_all().items()):
-        # 获取配置中对应通道的配置段
-        section = getattr(config.channels, name, None)
-        # 判断通道是否启用
-        if section is None:
-            enabled = False
-        elif isinstance(section, dict):
-            enabled = section.get("enabled", False)
-        else:
-            enabled = getattr(section, "enabled", False)
-        
-        # 向表格添加行：显示名称 + 启用状态（✓/✗）
-        table.add_row(
-            cls.display_name,
-            "[green]\u2713[/green]" if enabled else "[dim]\u2717[/dim]",
-        )
-
-    # 打印表格到终端
-    console.print(table)
-
-
-# ============================================================================
-# Plugin 插件管理命令组
-# ============================================================================
-# 创建子命令：plugins，管理通道插件
-plugins_app = typer.Typer(help="Manage channel plugins")
-app.add_typer(plugins_app, name="plugins")
-
-
-@plugins_app.command("list")
-def plugins_list():
-    """列出所有发现的通道插件（内置 + 第三方）"""
-    from nanobot.channels.registry import discover_all, discover_channel_names
-    from nanobot.config.loader import load_config
-
-    config = load_config()
-    # 内置通道名称集合
-    builtin_names = set(discover_channel_names())
-    # 所有通道
-    all_channels = discover_all()
-
-    # 创建输出表格
-    table = Table(title="Channel Plugins")
-    table.add_column("Name", style="cyan")
-    table.add_column("Source", style="magenta")
-    table.add_column("Enabled", style="green")
-
-    # 遍历通道，标记来源（内置/插件）和启用状态
-    for name in sorted(all_channels):
-        cls = all_channels[name]
-        source = "builtin" if name in builtin_names else "plugin"
-        section = getattr(config.channels, name, None)
-        # 判断启用状态
-        if section is None:
-            enabled = False
-        elif isinstance(section, dict):
-            enabled = section.get("enabled", False)
-        else:
-            enabled = getattr(section, "enabled", False)
-        table.add_row(
-            cls.display_name,
-            source,
-            "[green]yes[/green]" if enabled else "[dim]no[/dim]",
-        )
-
-    console.print(table)
-
-
 # ============================================================================
 # 系统状态命令
 # ============================================================================
@@ -830,18 +624,18 @@ def status():
             p = getattr(config.providers, spec.name, None)
             if p is None:
                 continue
-            if spec.is_oauth:
-                console.print(f"{spec.label}: [green]✓ (OAuth)[/green]")
-            elif spec.is_local:
+            if spec.is_gateway:
+                console.print(f"{spec.display_name}: [green]✓ (OAuth)[/green]")
+            elif spec.is_gateway:
                 # 本地模型显示 API 地址
                 if p.api_base:
-                    console.print(f"{spec.label}: [green]✓ {p.api_base}[/green]")
+                    console.print(f"{spec.display_name}: [green]✓ {p.api_base}[/green]")
                 else:
-                    console.print(f"{spec.label}: [dim]not set[/dim]")
+                    console.print(f"{spec.display_name}: [dim]not set[/dim]")
             else:
                 # 在线模型显示密钥状态
                 has_key = bool(p.api_key)
-                console.print(f"{spec.label}: {'[green]✓[/green]' if has_key else '[dim]not set[/dim]'}")
+                console.print(f"{spec.display_name}: {'[green]✓[/green]' if has_key else '[dim]not set[/dim]'}")
 
 
 # ============================================================================
@@ -888,11 +682,11 @@ def provider_login(
     # 获取登录处理器
     handler = _LOGIN_HANDLERS.get(spec.name)
     if not handler:
-        console.print(f"[red]Login not implemented for {spec.label}[/red]")
+        console.print(f"[red]Login not implemented for {spec.display_name}[/red]")
         raise typer.Exit(1)
 
     # 执行登录
-    console.print(f"{__logo__} OAuth Login - {spec.label}\n")
+    console.print(f"{__logo__} OAuth Login - {spec.display_name}\n")
     handler()
 
 
