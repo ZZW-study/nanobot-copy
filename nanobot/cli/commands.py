@@ -515,8 +515,8 @@ def agent(
                         # 每隔1秒轮询一次AI的输出
                         msg = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
                         # 如果是进度消息（如”正在搜索”）
-                        if msg.metadata.get(“_progress”):
-                            console.print(f”  [dim]↳ {msg.content}[/dim]”)
+                        if msg.metadata.get("_progress"):
+                            console.print(f"  [dim]↳ {msg.content}[/dim]")
                         # 如果是正式回答
                         elif not turn_done.is_set():
                             if msg.content:

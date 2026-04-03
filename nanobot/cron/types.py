@@ -54,7 +54,7 @@ class CronJob:
     enabled: bool = True  # 任务是否启用（禁用后不会自动执行）
 
     schedule: CronSchedule = field(default_factory=lambda: CronSchedule(kind="every"))  # 调度规则
-    pyload: CronPayload = field(default_factory=CronPayload)  # 任务执行内容
+    payload: CronPayload = field(default_factory=CronPayload)  # 任务执行内容
     state: CronJobState = field(default_factory=CronJobState)  # 任务运行状态
 
     created_at_ms: int = 0  # 创建时间（毫秒时间戳）
