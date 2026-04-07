@@ -1,35 +1,54 @@
 #!/usr/bin/env python3
 """
-nanobot 技能文件夹极简校验工具
-用于校验技能文件夹结构、SKILL.md 格式、配置项合法性
+nanobot 技能文件夹极简校验工具。
+
+用于校验技能文件夹结构、SKILL.md 格式、配置项合法性。
+
+用法：
+    python quick_validate.py <技能文件夹路径>
+
+此脚本在以下场景会被调用：
+1. 使用 package_skill.py 打包技能前（自动触发）
+2. 手动运行校验技能是否符合规范
+3. CI/CD 流程中自动化检查技能质量
 """
 
+# 导入正则表达式模块（用于技能名称格式校验）
 import re
+# 导入 sys 模块（用于命令行参数和程序退出）
 import sys
+# 导入 Path 类（用于跨平台的文件路径处理）
 from pathlib import Path
+# 导入 Optional 类型注解（表示值可以为 None）
 from typing import Optional
 
-# 尝试导入yaml库，用于解析前端配置
+# ========== PyYAML 依赖尝试导入 ==========
+# 尝试导入 yaml 库，用于解析 SKILL.md 中的 YAML 前端配置
+# 如果未安装 PyYAML，则使用简易解析器作为降级方案
 try:
     import yaml
 except ModuleNotFoundError:
-    yaml = None
+    yaml = None  # 标记 yaml 不可用
 
 # ===================== 常量配置 =====================
-# 技能名称最大长度
+# 技能名称最大长度限制（超过则校验失败）
 MAX_SKILL_NAME_LENGTH = 64
-# 允许的SKILL.md前端配置键名
+
+# 允许的 SKILL.md 前端配置键名（YAML frontmatter）
+# 这些键名是 nanobot 技能规范定义的合法字段
 ALLOWED_FRONTMATTER_KEYS = {
-    "name",
-    "description",
-    "metadata",
-    "always",
-    "license",
-    "allowed-tools",
+    "name",        # 技能名称（必填）
+    "description", # 技能描述（必填）
+    "metadata",    # 元数据（可选，包含 nanobot/openclaw 配置）
+    "always",      # 是否始终启用（布尔值）
+    "license",     # 许可证信息
+    "allowed-tools", # 允许使用的工具列表
 }
-# 允许的资源目录名称
+
+# 允许的资源目录名称（技能根目录下只能有这些子目录）
 ALLOWED_RESOURCE_DIRS = {"scripts", "references", "assets"}
-# 占位符标记（校验是否未替换TODO）
+
+# 占位符标记（用于检测用户是否忘记替换 TODO 内容）
 PLACEHOLDER_MARKERS = ("[todo", "todo:")
 
 
@@ -283,12 +302,21 @@ def validate_skill(skill_path):
 
 
 if __name__ == "__main__":
-    # 主程序入口：处理命令行参数
+    # ===================== 程序入口 =====================
+    # 当脚本直接运行时执行此段代码
+
+    # 检查命令行参数数量：需要传入技能文件夹路径
     if len(sys.argv) != 2:
         print("用法：python quick_validate.py <技能文件夹路径>")
-        sys.exit(1)
+        sys.exit(1)  # 参数数量不对，退出并返回错误码 1
 
-    # 执行校验并输出结果
+    # 执行技能校验：传入第一个命令行参数（技能文件夹路径）
     valid, message = validate_skill(sys.argv[1])
+
+    # 打印校验结果（成功或失败的具体信息）
     print(message)
+
+    # 根据校验结果设置程序退出码
+    # valid=True → 退出码 0（成功）
+    # valid=False → 退出码 1（失败）
     sys.exit(0 if valid else 1)
