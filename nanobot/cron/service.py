@@ -131,8 +131,6 @@ class CronService:
         schedule: CronSchedule,
         message: str,
         deliver: bool = False,
-        channel: str | None = None,
-        to: str | None = None,
         delete_after_run: bool = False,
     ) -> CronJob:
         """创建任务并立即持久化，同时重置调度器唤醒点。"""
@@ -148,8 +146,6 @@ class CronService:
                 kind="agent_turn",
                 message=message,
                 deliver=deliver,
-                channel=channel,
-                to=to,
             ),
             state=CronJobState(next_run_at_ms=_compute_next_run(schedule, now)),
             created_at_ms=now,
@@ -342,8 +338,6 @@ class CronService:
                 kind=data["payload"].get("kind", "agent_turn"),
                 message=data["payload"].get("message", ""),
                 deliver=data["payload"].get("deliver", False),
-                channel=data["payload"].get("channel"),
-                to=data["payload"].get("to"),
             ),
             state=CronJobState(
                 next_run_at_ms=data.get("state", {}).get("nextRunAtMs"),
@@ -373,8 +367,6 @@ class CronService:
                 "kind": job.payload.kind,
                 "message": job.payload.message,
                 "deliver": job.payload.deliver,
-                "channel": job.payload.channel,
-                "to": job.payload.to,
             },
             "state": {
                 "nextRunAtMs": job.state.next_run_at_ms,

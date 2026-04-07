@@ -1,13 +1,13 @@
 """Agent 主循环与单轮消息处理。
 
 `AgentLoop` 是运行时入口，负责把下面几件事串起来：
-1. 从消息总线或直接调用拿到用户输入。
+1. 从直接调用拿到用户输入。
 2. 找到对应 session，并构造要发给模型的上下文。
 3. 处理模型的普通回复或工具调用。
 4. 把本轮消息安全地写回 session。
 5. 在合适的时机触发长期记忆归档。
 
-因此它既是调度层，也是“消息 -> 模型 -> 工具 -> 会话落盘”这条链路的汇总点。
+因此它既是调度层，也是"消息 -> 模型 -> 工具 -> 会话落盘"这条链路的汇总点。
 """
 
 from __future__ import annotations
@@ -16,7 +16,6 @@ import asyncio
 import json
 import re
 from contextlib import AsyncExitStack
-from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -28,8 +27,6 @@ from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTo
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
-from nanobot.bus.events import InboundMessage, OutboundMessage
-from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
 
@@ -46,7 +43,7 @@ class AgentLoop:
     """运行中的 Agent 实例。
 
     这个类故意把核心流程收敛成少量 helper：
-    - `_process_message` 负责判断消息类型和命令。
+    - `process_direct` 负责直接处理用户输入。
     - `_run_turn` 负责单轮正常对话。
     - `_run_agent_loop` 负责模型与工具之间的循环。
 
@@ -59,7 +56,6 @@ class AgentLoop:
 
     def __init__(
         self,
-        bus: MessageBus,
         provider: LLMProvider,
         workspace: Path,
         model: str | None = None,
@@ -79,15 +75,14 @@ class AgentLoop:
         """初始化运行时依赖与内部状态。"""
         from nanobot.config.schema import ExecToolConfig, WebSearchConfig
 
-        self.bus = bus                                      # 消息总线，用于接收 inbound 消息和发布 outbound 回复
         self.provider = provider                            # LLM 提供者抽象（负责与模型交互）
         self.workspace = workspace                          # 工作目录，文件工具等会基于此限制或执行文件操作
-        self.model = model or provider.get_default_model()  
+        self.model = model or provider.get_default_model()
         self.max_iterations = max_iterations                # 单轮最大工具调用/迭代次数，防止无限循环
         self.temperature = temperature                      # 模型的采样温度，决定回答的随机性
         self.max_tokens = max_tokens                        # 模型返回最大 token 限制
         self.memory_window = memory_window                  # 回话历史窗口大小，用于构建上下文
-        
+
         self.reasoning_effort = reasoning_effort
         self.web_search_config = web_search_config or WebSearchConfig()
         self.web_proxy = web_proxy
@@ -96,13 +91,12 @@ class AgentLoop:
         self.restrict_to_workspace = restrict_to_workspace
 
         self.context = ContextBuilder(workspace)            # ContextBuilder 负责把会话历史/当前消息转换为模型输入的 messages
-        
-        self.sessions = session_manager or SessionManager(workspace)    # Session 管理器负责会话的创建/保存/加载
-        
-        self.tools = ToolRegistry()                         # 工具注册中心，包含文件/网络/执行等工具实例
-        
 
-        self._running = False
+        self.sessions = session_manager or SessionManager(workspace)    # Session 管理器负责会话的创建/保存/加载
+
+        self.tools = ToolRegistry()                         # 工具注册中心，包含文件/网络/执行等工具实例
+
+
         self._mcp_servers = mcp_servers or {}
         self._mcp_stack: AsyncExitStack | None = None
         self._mcp_connected = False
@@ -111,13 +105,10 @@ class AgentLoop:
         self._consolidating: set[str] = set()
         self._consolidation_tasks: set[asyncio.Task[Any]] = set()
         self._consolidation_locks: dict[str, asyncio.Lock] = {}
-        self._active_tasks: dict[str, set[asyncio.Task[Any]]] = {}
         self._processing_lock = asyncio.Lock()
         # 全局消息处理锁，保证单条消息的处理是串行的（避免会话竞争）
 
         self._register_default_tools()
-        # `_active_tasks` 用于跟踪每个 session 下正在执行的 asyncio.Task，
-        # 便于实现像 `/stop` 这样的控制命令时，能够取消这些任务并统计结果。
         # `_consolidation_*` 系列字段负责长期记忆归档任务的并发控制与回收。
 
     # ---- 工具注册与初始化 ----
@@ -180,13 +171,6 @@ class AgentLoop:
         finally:
             self._mcp_connecting = False
 
-    def _set_tool_context(self, channel: str, chat_id: str) -> None:
-        """把当前 channel/chat_id 注入给支持上下文的工具。"""
-        for name in self.tools.tool_names:
-            tool = self.tools.get(name)
-            if tool and hasattr(tool, "set_context"):
-                tool.set_context(channel, chat_id)
-
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
         """移除模型输出中的 `<think>...</think>` 思维块。"""
@@ -221,20 +205,20 @@ class AgentLoop:
         initial_messages: list[dict[str, Any]],
         on_progress: Callable[..., Awaitable[None]] | None = None,
     ) -> tuple[str | None, list[str], list[dict[str, Any]]]:
-        """驱动“模型回复 -> 工具执行 -> 再喂回模型”的循环。
+        """驱动"模型回复 -> 工具执行 -> 再喂回模型"的循环。
 
         返回三样东西：
         1. 最终用户可见回复
         2. 本轮实际调用过的工具列表
         3. 完整消息链，用于后续写回 session
         """
-        
+
         messages = list(initial_messages)       # 复制初始消息链到局部变量，后续会在循环中追加 assistant/tool 的中间消息
         tools_used: list[str] = []              # 本轮实际上被调用过的工具名称（按顺序，会在写回历史时去重）
         final_content: str | None = None        # 最终返回给用户的文本（清理过 <think> 标签的回复），初始为 None
 
         for _ in range(self.max_iterations):
-            # 每一轮都把”当前消息链 + 工具 schema”发给模型，让模型自行决定
+            # 每一轮都把"当前消息链 + 工具 schema"发给模型，让模型自行决定
             # 是直接回答，还是继续调用工具。
             # 把当前消息链交给 LLMProvider，请求模型决定是回答还是调用工具
             logger.debug("Agent loop iteration {}, messages count: {}", _ + 1, len(messages))
@@ -252,14 +236,14 @@ class AgentLoop:
 
             if response.has_tool_calls:
                 # 如果模型一边思考一边决定调用工具，这里把精简后的状态向外发送，
-                # 让 CLI 或前端能够展示“正在做什么”。
+                # 让 CLI 或前端能够展示"正在做什么"。
                 if on_progress:
                     thought = self._strip_think(response.content)
                     if thought:
                         await on_progress(thought)
                     await on_progress(self._tool_hint(response.tool_calls), tool_hint=True)
 
-                # 将模型返回的 tool_calls 转为写入消息链的“函数调用”结构，
+                # 将模型返回的 tool_calls 转为写入消息链的"函数调用"结构，
                 # 这样在执行工具前，消息链中就包含了 assistant 的调用意图，
                 # 便于下一轮模型看到自己的调用历史。
                 tool_call_dicts = [
@@ -274,7 +258,7 @@ class AgentLoop:
                     for tool_call in response.tool_calls
                 ]
                 # 先把 assistant 的调用意图写入消息链，再执行工具。
-                # 这样下一轮模型能看到“自己刚才调用了什么”。
+                # 这样下一轮模型能看到"自己刚才调用了什么"。
                 self.context.add_assistant_message(
                     messages,
                     response.content,
@@ -299,7 +283,7 @@ class AgentLoop:
             clean = self._strip_think(response.content)
             if response.finish_reason == "error":
                 logger.error("大模型返回错误：{}", (clean or "")[:200])
-                final_content = clean or "抱歉，调用大模型时发生了错误。"
+                final_content = clean or "抱歉，调用大模型时发生了错误。 "
                 break
 
             self.context.add_assistant_message(
@@ -322,89 +306,6 @@ class AgentLoop:
 
         return final_content, tools_used, messages
 
-    async def run(self) -> None:
-        """从消息总线持续消费入站消息，直到显式停止。"""
-        self._running = True
-        await self._connect_mcp()
-        logger.info("Agent 主循环已启动")
-
-        while self._running:
-            try:
-                msg = await asyncio.wait_for(self.bus.consume_inbound(), timeout=1.0)
-            except asyncio.TimeoutError:
-                continue
-
-            if msg.content.strip().lower() == "/stop":
-                await self._handle_stop(msg)
-                continue
-
-            # 使用 create_task 将单条消息的处理放到后台任务中，
-            # 保证主循环能快速返回继续消费新消息，避免因单条消息处理耗时而阻塞。
-            task = asyncio.create_task(self._dispatch(msg))
-            # 记录该任务到 _active_tasks，以便实现 /stop 等控制命令时能取消它
-            self._track_active_task(msg.session_key, task)
-
-    def _track_active_task(self, session_key: str, task: asyncio.Task[Any]) -> None:
-        """登记一个正在运行的会话任务，供 `/stop` 使用。"""
-        self._active_tasks.setdefault(session_key, set()).add(task)
-        task.add_done_callback(partial(self._clear_active_task, session_key))
-
-    def _clear_active_task(self, session_key: str, task: asyncio.Task[Any]) -> None:
-        """任务结束后，把它从活跃任务表里清掉。"""
-        tasks = self._active_tasks.get(session_key)
-        if not tasks:
-            return
-        tasks.discard(task)
-        if not tasks:
-            self._active_tasks.pop(session_key, None)
-
-    async def _handle_stop(self, msg: InboundMessage) -> None:
-        """处理 `/stop` 命令，取消当前会话下仍在运行的任务。"""
-        tasks = list(self._active_tasks.pop(msg.session_key, set()))
-        cancelled = sum(1 for task in tasks if not task.done() and task.cancel())
-
-        for task in tasks:
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
-
-        content = f"已停止 {cancelled} 个任务。" if cancelled else "当前没有可停止的活动任务。"
-        await self.bus.publish_outbound(
-            OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=content)
-        )
-
-    async def _dispatch(self, msg: InboundMessage) -> None:
-        """串行处理单条消息，并负责把结果重新发布到总线。"""
-        # 使用全局处理锁保证单条消息的处理逻辑在同一时刻只有一个执行体，
-        # 这样可以简化会话落盘逻辑并避免并发写导致的竞态问题。
-        async with self._processing_lock:
-            try:
-                response = await self._process_message(msg)
-                if response is not None:
-                    await self.bus.publish_outbound(response)
-                elif msg.channel == "cli":
-                    await self.bus.publish_outbound(
-                        OutboundMessage(
-                            channel=msg.channel,
-                            chat_id=msg.chat_id,
-                            content="",
-                            metadata=msg.metadata or {},
-                        )
-                    )
-            except asyncio.CancelledError:
-                logger.info("会话 {} 的任务已取消", msg.session_key)
-                raise
-            except Exception:
-                logger.exception("处理会话 {} 的消息时发生异常", msg.session_key)
-                await self.bus.publish_outbound(
-                    OutboundMessage(
-                        channel=msg.channel,
-                        chat_id=msg.chat_id,
-                        content="抱歉，处理这条消息时发生了错误。",
-                    )
-                )
-
     async def close_mcp(self) -> None:
         """关闭 MCP 连接栈，通常在进程退出前调用。"""
         if not self._mcp_stack:
@@ -418,140 +319,65 @@ class AgentLoop:
             self._mcp_stack = None
             self._mcp_connected = False
 
-    def stop(self) -> None:
-        """请求主循环停止，不再继续消费新消息。"""
-        self._running = False
-        logger.info("Agent 主循环准备停止")
-
     async def _process_message(
         self,
-        msg: InboundMessage,
-        session_key: str | None = None,
+        content: str,
+        session_key: str,
         on_progress: Callable[[str], Awaitable[None]] | None = None,
-    ) -> OutboundMessage | None:
-        """处理单条消息，并返回最终的 outbound 消息。
+    ) -> str:
+        """处理单条消息，并返回最终回复。
 
-        这里会先按消息来源做分流：
-        - `system` 消息走后台任务路径
-        - 普通消息走用户会话路径
-
-        普通消息内部还会进一步处理内建命令，例如 `/new`、`/help`。
+        这里会处理内建命令，例如 `/new`、`/help`。
         """
-        if msg.channel == "system":
-            # system 消息的 chat_id 允许带 `channel:chat_id` 复合格式，
-            # 这样后台任务可以精准落到原始目标对话。
-            channel, chat_id = self._resolve_system_target(msg.chat_id)
-            logger.info("正在处理来自 {} 的系统消息", msg.sender_id)
-            session = self.sessions.get_or_create(f"{channel}:{chat_id}")
-            # 对 system 消息直接触发一次完整的对话回合，on_progress 由调用者传入用于反馈进度
-            content = await self._run_turn(
-                session,
-                content=msg.content,
-                channel=channel,
-                chat_id=chat_id,
-                on_progress=on_progress,
-            )
-            return OutboundMessage(
-                channel=channel,
-                chat_id=chat_id,
-                content=content or "后台任务已执行完成。",
-            )
+        preview = content[:80] + "..." if len(content) > 80 else content
+        logger.info("正在处理消息：{}", preview)
 
-        preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
-        logger.info("正在处理来自 {}:{} 的消息：{}", msg.channel, msg.sender_id, preview)
-
-        key = session_key or msg.session_key
-        session = self.sessions.get_or_create(key)
-        # session_key 允许外部指定（例如 CLI 的一次性调用），否则使用消息自带的 session_key
-        command = msg.content.strip().lower()
+        session = self.sessions.get_or_create(session_key)
+        command = content.strip().lower()
 
         if command == "/new":
-            # /new 的语义不是简单清空，而是“先归档，再开始新会话”。
+            # /new 的语义不是简单清空，而是"先归档，再开始新会话"。
             if not await self._archive_and_reset_session(session):
-                return OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
-                    content="长期记忆归档失败，会话未清空，请稍后重试。",
-                )
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content="已开始新的会话。")
+                return "长期记忆归档失败，会话未清空，请稍后重试。"
+            return "已开始新的会话。"
 
         if command == "/help":
-            return OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content="nanobot 可用命令：\n/new - 开始新会话\n/stop - 停止当前任务\n/help - 查看帮助",
-            )
+            return "nanobot 可用命令：\n/new - 开始新会话\n/help - 查看帮助"
 
         # 只有会话累计到一定长度时，才在后台触发长期记忆归档。
         self._schedule_consolidation(session)
 
-        async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
-            """把模型中间进度包装成 outbound 消息发回前端。"""
-            metadata = dict(msg.metadata or {})
-            metadata["_progress"] = True
-            metadata["_tool_hint"] = tool_hint
-            await self.bus.publish_outbound(
-                OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
-                    content=content,
-                    metadata=metadata,
-                )
-            )
-
         final_content = await self._run_turn(
             session,
-            content=msg.content,
-            channel=msg.channel,
-            chat_id=msg.chat_id,
-            media=msg.media or None,
-            on_progress=on_progress or _bus_progress,
+            content=content,
+            on_progress=on_progress,
         )
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
-        logger.info("发送给 {}:{} 的回复：{}", msg.channel, msg.sender_id, preview)
+        logger.info("回复：{}", preview)
 
-        return OutboundMessage(
-            channel=msg.channel,
-            chat_id=msg.chat_id,
-            content=final_content,
-            metadata=msg.metadata or {},
-        )
-
-    @staticmethod
-    def _resolve_system_target(chat_id: str) -> tuple[str, str]:
-        """解析 system 消息的目标 channel/chat_id。"""
-        if ":" in chat_id:
-            return tuple(chat_id.split(":", 1))  # type: ignore[return-value]
-        return "cli", chat_id
+        return final_content
 
     async def _run_turn(
         self,
         session: Session,
         *,
         content: str,
-        channel: str,
-        chat_id: str,
         media: list[str] | None = None,
         on_progress: Callable[..., Awaitable[None]] | None = None,
     ) -> str:
         """执行一轮标准对话。
 
-        这层是普通消息和 system 消息共用的主路径：
-        1. 注入工具上下文
-        2. 从 session 取历史
-        3. 构造模型请求
-        4. 执行模型/工具循环
-        5. 把本轮结果写回 session
+        这层是主路径：
+        1. 从 session 取历史
+        2. 构造模型请求
+        3. 执行模型/工具循环
+        4. 把本轮结果写回 session
         """
-        self._set_tool_context(channel, chat_id)
-
         history = session.get_history(max_messages=self.memory_window)
         initial_messages = self.context.build_messages(
             history=history,
             current_message=content,
             media=media,
-            channel=channel,
-            chat_id=chat_id,
         )
 
         final_content, tools_used, all_messages = await self._run_agent_loop(
@@ -719,13 +545,9 @@ class AgentLoop:
         self,
         content: str,
         session_key: str = "cli:direct",
-        channel: str = "cli",
-        chat_id: str = "direct",
         on_progress: Callable[[str], Awaitable[None]] | None = None,
     ) -> str:
         """供 CLI 或脚本直接调用的一次性入口。"""
         # 用于脚本/测试/CLI 的同步入口：确保 MCP 已连接（若需要），然后同步处理一条消息并返回文本。
         await self._connect_mcp()
-        msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
-        response = await self._process_message(msg, session_key=session_key, on_progress=on_progress)
-        return response.content if response else ""
+        return await self._process_message(content, session_key=session_key, on_progress=on_progress)

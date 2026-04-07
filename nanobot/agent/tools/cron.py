@@ -1,19 +1,13 @@
-"""
-定时任务工具 (CronTool)
+"""定时任务工具 (CronTool)
 功能：为AI智能体提供 定时提醒、循环任务、一次性定时任务 的调度能力
 支持三种调度模式：秒级循环、Cron表达式、指定ISO时间执行
 """
-# 上下文变量：用于异步编程中安全管理执行状态，避免并发冲突
 from contextvars import ContextVar
 from datetime import datetime
-# 类型注解：任意类型
 from typing import Any
 
-# 继承AI工具基类，遵循框架统一的工具规范
 from nanobot.agent.tools.base import Tool
-# 定时任务核心服务：负责任务的存储、调度、触发、管理
 from nanobot.cron.service import BEIJING_TZ, CronService
-# 定时任务调度规则的数据结构：定义任务的执行方式
 from nanobot.cron.types import CronSchedule
 
 
@@ -31,23 +25,9 @@ class CronTool(Tool):
         """
         # 底层定时任务服务实例，真正执行任务调度的核心对象
         self._cron = cron_service
-        # 消息推送的渠道（如：cli终端、web页面、discord等）
-        self._channel = ""
-        # 消息推送的目标会话ID（区分不同用户/聊天窗口）
-        self._chat_id = ""
         # 异步安全的上下文变量：标记当前是否正在执行定时任务回调
         # 作用：禁止在定时任务内部创建新任务，防止嵌套死循环
         self._in_cron_context: ContextVar[bool] = ContextVar("cron_in_context", default=False)
-
-    def set_context(self, channel: str, chat_id: str) -> None:
-        """
-        设置会话上下文（关键方法）
-        作用：定时任务触发后，将提醒消息推送到正确的用户/渠道
-        :param channel: 消息渠道标识
-        :param chat_id: 用户会话唯一标识
-        """
-        self._channel = channel
-        self._chat_id = chat_id
 
     def set_cron_context(self, active: bool):
         """
@@ -137,15 +117,15 @@ class CronTool(Tool):
                 return "错误：不能在定时任务执行过程中再次创建新的定时任务。"
             # 调用私有方法创建任务
             return self._add_job(message, every_seconds, cron_expr, at)
-        
+
         # 动作2：列出所有定时任务
         elif action == "list":
             return self._list_jobs()
-        
+
         # 动作3：删除定时任务
         elif action == "remove":
             return self._remove_job(job_id)
-        
+
         # 未知动作，返回错误提示
         return f"错误：未知动作 {action}"
 
@@ -164,24 +144,20 @@ class CronTool(Tool):
         # 校验1：添加任务必须填写提醒消息
         if not message:
             return "错误：创建任务时必须提供提醒内容。"
-        
-        # 校验2：必须设置会话上下文，否则无法推送消息
-        if not self._channel or not self._chat_id:
-            return "错误：当前没有可用的会话上下文，无法确定提醒要发往哪个渠道。"
-        
+
         # ==================== 构建任务调度规则 ====================
         # 标记：一次性任务执行后是否自动删除（循环任务为False）
         delete_after = False
-        
+
         # 类型1：循环任务（按秒执行，如每30秒执行一次）
         if every_seconds:
             # 转换为毫秒（底层服务使用毫秒单位）
             schedule = CronSchedule(kind="every", every_ms=every_seconds * 1000)
-        
+
         # 类型2：Cron表达式定时任务（如每天、每周、每月）
         elif cron_expr:
             schedule = CronSchedule(kind="cron", expr=cron_expr)
-        
+
         # 类型3：一次性定时任务（指定ISO时间执行）
         elif at:
             try:
@@ -198,7 +174,7 @@ class CronTool(Tool):
             schedule = CronSchedule(kind="at", at_ms=at_ms)
             # 一次性任务执行完成后自动删除
             delete_after = True
-        
+
         # 校验5：必须指定一种调度方式（循环/cron/一次性）
         else:
             return "错误：必须提供 every_seconds、cron_expr 或 at 其中之一。"
@@ -208,14 +184,11 @@ class CronTool(Tool):
             name=message[:30],          # 任务名称：截取消息前30字符，避免过长
             schedule=schedule,           # 调度规则
             message=message,             # 完整提醒消息
-            deliver=True,                # 自动推送消息给用户
-            channel=self._channel,       # 推送渠道
-            to=self._chat_id,            # 推送目标用户
             delete_after_run=delete_after,  # 执行后是否自动删除
         )
-        
+
         # 返回创建成功提示，包含任务ID（用于后续删除）
-        return f"已创建任务“{job.name}”（ID：{job.id}）"
+        return f"已创建任务 {job.name}（ID：{job.id}）"
 
     # ==================== 私有方法：查询所有定时任务 ====================
     def _list_jobs(self) -> str:

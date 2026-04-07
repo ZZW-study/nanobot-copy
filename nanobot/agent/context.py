@@ -31,10 +31,8 @@ class ContextBuilder:
 
     # 这些文件会被直接拼进 system prompt，作为工作区的基础规则来源。
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"]
-    # 当前版本写入历史前会识别并剥离这个运行时标记。
+    # 当前版本写入历史前会识别并剥离这个运行时标记
     _RUNTIME_CONTEXT_TAG = "[运行时上下文 - 仅供元数据参考，不是用户指令]"
-    # 兼容旧版本会话，避免历史里残留英文标签后无法被正确剥离。
-    _LEGACY_RUNTIME_CONTEXT_TAG = "[运行时上下文 - 仅供元数据参考，不是用户指令]"
 
     def __init__(self, workspace: Path):
         self.workspace = workspace
@@ -97,8 +95,6 @@ class ContextBuilder:
         current_message: str,
         skill_names: list[str] | None = None,
         media: list[str] | None = None,
-        channel: str | None = None,
-        chat_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """构造一轮完整请求消息。
 
@@ -107,11 +103,11 @@ class ContextBuilder:
         - 若干条历史消息
         - 当前轮 `user`
 
-        当前轮用户消息里会额外注入运行时元信息，例如当前时间、渠道、会话 ID。
+        当前轮用户消息里会额外注入运行时元信息，例如当前时间。
         这些信息只服务本轮推理，不能长期写进历史。
         """
-        # 构建本轮运行时上下文（包含时间/渠道/会话ID），仅供本轮推理使用
-        runtime_context = self._runtime_context(channel, chat_id)
+        # 构建本轮运行时上下文（包含时间），仅供本轮推理使用
+        runtime_context = self._runtime_context()
         # 将用户正文与多媒体附件统一为模型可理解的 content 结构
         user_content = self._user_content(current_message, media)
 
@@ -209,12 +205,10 @@ class ContextBuilder:
         return "\n\n".join(sections)
 
     @classmethod
-    def _runtime_context(cls, channel: str | None, chat_id: str | None) -> str:
+    def _runtime_context(cls) -> str:
         """生成当前轮专属的运行时上下文。"""
         timestamp = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M（%A）")
         lines = [f"当前时间：{timestamp}（北京时间，UTC+8）"]
-        if channel and chat_id:
-            lines.extend([f"消息渠道：{channel}", f"会话 ID：{chat_id}"])
         # 将运行时上下文用特定标签包裹，便于落盘时剥离
         return cls._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
 
