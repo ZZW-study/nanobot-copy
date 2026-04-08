@@ -117,8 +117,9 @@ class LLMProvider(ABC):
         sanitized = []
         for msg in messages:
             clean = {key: value for key, value in msg.items() if key in allowed_keys}
+            # 确保 assistant 消息有有效的 content（部分 API 不接受 None）
             if clean.get("role") == "assistant" and "content" not in clean:
-                clean["content"] = None
+                clean["content"] = ""
             sanitized.append(clean)
         return sanitized
 

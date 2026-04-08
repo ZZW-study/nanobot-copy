@@ -84,8 +84,8 @@ class WebSearchTool(Tool):
 
     # 直接用 类属性 实现了抽象属性，可以。
 
-    name = "web_search",
-    description ="搜索网页并返回标题、链接和摘要。"
+    name = "web_search"
+    description = "搜索网页并返回标题、链接和摘要。"
     parameters = {
         "type": "object",
         "properties": {
@@ -116,20 +116,24 @@ class WebSearchTool(Tool):
             return "错误：未设置 BOCHA_API_KEY。请在配置文件或环境变量中配置它。"
 
         try:
-            # 使用异步 HTTP 客户端发送搜索请求
+            # 使用异步 HTTP 客户端发送搜索请求（POST 方法）
             async with httpx.AsyncClient(proxy=self.proxy) as client:
-                r = await client.get(
+                r = await client.post(
                     "https://api.bocha.cn/v1/web-search",
-                    params={"q": query, "count": n},
-                    headers={"Accept": "application/json", "X-Subscription-Token": api_key},
-                    timeout=10.0,
+                    json={"query": query, "count": n, "summary": True},
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {api_key}"
+                    },
+                    timeout=30.0,
                 )
                 # 检查 HTTP 状态码，失败会抛出异常
                 r.raise_for_status()
             # 提取搜索结果列表
+            data = r.json()
             items = [
-                {"title": x.get("title", ""), "url": x.get("url", ""), "content": x.get("description", "")}
-                for x in r.json().get("web", {}).get("results", [])
+                {"title": x.get("title", ""), "url": x.get("url", ""), "content": x.get("summary", "") or x.get("snippet", "")}
+                for x in data.get("data", {}).get("webPages", {}).get("value", [])
             ]
             return _format_results(query, items, n)
         except Exception as e:
