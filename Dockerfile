@@ -7,9 +7,8 @@
 # --------------------------------------------
 # 第一步：选择基础镜像
 # --------------------------------------------
-# 使用 Python 3.11 slim 镜像
-# slim 版本体积小，适合 CLI 工具
-FROM python:3.11-slim
+# 使用阿里云镜像加速
+FROM docker.1ms.run/python:3.11-slim
 
 # --------------------------------------------
 # 第二步：设置工作目录
@@ -29,15 +28,16 @@ RUN apt-get update && apt-get install -y \
 # --------------------------------------------
 # 先复制 requirements.txt（如果存在）
 # 利用 Docker 缓存机制加速构建
-COPY requirements.txt . 2>/dev/null || true
+COPY requirements.txt .
 
 # --------------------------------------------
 # 第五步：安装 Python 依赖
 # --------------------------------------------
-# 如果 requirements.txt 存在，则安装依赖
+# 使用阿里云镜像源，更稳定
 RUN if [ -f requirements.txt ]; then \
     pip install --no-cache-dir -r requirements.txt \
-    -i https://pypi.tuna.tsinghua.edu.cn/simple; \
+    -i https://mirrors.aliyun.com/pypi/simple/ \
+    --trusted-host mirrors.aliyun.com; \
     fi
 
 # --------------------------------------------
@@ -50,7 +50,8 @@ COPY . .
 # --------------------------------------------
 # -e 表示可编辑模式，方便开发
 RUN pip install -e . \
-    -i https://pypi.tuna.tsinghua.edu.cn/simple
+    -i https://mirrors.aliyun.com/pypi/simple/ \
+    --trusted-host mirrors.aliyun.com
 
 # --------------------------------------------
 # 第八步：创建配置目录

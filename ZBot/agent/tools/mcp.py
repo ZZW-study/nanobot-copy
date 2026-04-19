@@ -172,9 +172,9 @@ async def connect_mcp_servers(
                     # 创建异步 HTTP 客户端实例
                     return httpx.AsyncClient(
                         headers=merged_headers or None,  # HTTP 请求头
-                        follow_redirects=True,          # 自动跟随重定向
-                        timeout=timeout,                # 网络超时设置
-                        auth=auth,                      # 认证对象（如有）
+                        follow_redirects=True,           # 自动跟随重定向
+                        timeout=timeout,                 # 网络超时设置
+                        auth=auth,                       # 认证对象（如有）
                     )
 
                 # 建立 SSE 连接
