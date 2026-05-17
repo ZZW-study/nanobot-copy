@@ -43,6 +43,7 @@ class LongTermMemoryStore:
     _instance: Optional["LongTermMemoryStore"] = None
 
     def __new__(cls,workspace_path: Path):
+        """创建或复用长期记忆存储单例。"""
         if cls._instance is None:
             cls._instance = super().__new__(cls)
             cls.store_path = workspace_path / "memory" / "LONG_TERM_MEMORY.md"
@@ -73,12 +74,6 @@ class LongTermMemoryStore:
             logger.error(f"写入长期记忆文件失败: {e}")
             return False
 
-
-    async def _read_long_term(self) -> str:
-        """读取 `LONG_TERM_MEMORY.md` 的内容，如果文件不存在或为空，则返回空字符串。"""
-        if not self.store_path.exists():
-            return ""
-        return await asyncio.to_thread(self.store_path.read_text, encoding="utf-8")
 
     async def _generate_long_term_memory(self, provider: LLMProvider, model: str, merged_filtered_daily_memory: str) -> str:
         """调用模型生成新的长期记忆内容。"""
@@ -143,6 +138,12 @@ class LongTermMemoryStore:
             f"{new_memory}\n\n"
             "请返回更新后的完整长期记忆内容，每条以 [YYYY-MM-DD HH:MM] 时间戳开头，只包含【事实】和【偏好】两部分。"
         )
+
+    async def _read_long_term(self) -> str:
+        """读取 `LONG_TERM_MEMORY.md` 的内容，如果文件不存在或为空，则返回空字符串。"""
+        if not self.store_path.exists():
+            return ""
+        return await asyncio.to_thread(self.store_path.read_text, encoding="utf-8")
     
 # 全局单例
 config = Config()

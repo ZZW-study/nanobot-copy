@@ -3,13 +3,51 @@
 的工具来完成 I/O、文件操作、网络请求等行为。对参数的解析、类型
 转换与校验逻辑也封装在此基类中，方便各工具统一处理输入。
 """
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
+
+if TYPE_CHECKING:
+    from ZBot.agent.base_agent import BaseAgent
+
+
+def format_tool_error(
+    error: str,
+    *,
+    attempted: str,
+    observed: str | None = None,
+    do_not_repeat: str | None = None,
+    next_action: str | None = None,
+) -> str:
+    """生成可行动的工具失败结果。
+
+    工具失败时不要只返回 error；模型只会看到 tool_result，
+    所以这里统一告诉它：刚才尝试了什么、观察到了什么、不要重复什么、
+    下一步应该如何获得新信息。
+    """
+    lines = [f"错误：{error}", f"已尝试：{attempted}"]
+    if observed:
+        lines.append(f"观察结果：{observed}")
+    if do_not_repeat:
+        lines.append(f"不要重复：{do_not_repeat}")
+    if next_action:
+        lines.append(f"建议下一步：{next_action}")
+    return "\n".join(lines)
+
+
 class Tool(ABC):
     """工具抽象基类。"""
 
     # JSON Schema 的基础类型到 Python 类型的映射，用于快速判断与 isinstance
-  
+    # ClassVar[...]
+    # 标注这是类变量（定义在类体内部、方法外部，属于整个类，所有实例共享同一份。），不属于实例属性，只在类层面定义，实例不能覆盖 / 单独赋值（实例对象不能动他）。
+    # 外层容器：dict[str, ...]
+    # 字典：key 是字符串，value 是后面的联合类型。
+    # value 联合类型：type[Any] | tuple[type[Any], ...]
+    # type[Any]：任意类本身（不是实例，是类对象，如 int、str 这种）
+    # tuple[type[Any], ...]：不定长元组，里面每个元素都是一个类
+    # | 二选一：字典的值可以是单个类，也可以是多个类组成的元组
     _TYPE_MAP: ClassVar[dict[str, type[Any] | tuple[type[Any], ...]]] = {
         "string": str,
         "integer": int,
@@ -19,7 +57,14 @@ class Tool(ABC):
         "object": dict,
     }
 
+    # 所属的 Agent 实例（由 Agent 注册工具时自动设置，子类可通过此属性访问父 Agent 的配置和能力）
+    agent: BaseAgent | None = None
 
+    def bind_agent(self, agent: BaseAgent) -> None:
+        """绑定所属的 Agent 实例，由 ToolRegistry.register 调用。"""
+        self.agent = agent
+
+    # 子类必须要实现的抽象属性
     @property
     @abstractmethod
     def name(self) -> str:
@@ -60,7 +105,34 @@ class Tool(ABC):
         return self._cast_object(params, schema)
 
 
+    def validate_params(self, params: dict[str, Any]) -> list[str]:
+        """验证参数是否符合 `parameters` schema，返回错误消息列表（空表示通过）。
+
+        基本规则：传入参数必须是 dict，且 schema 的根类型应为 object。
+        具体校验通过 `_validate` 递归完成。
+        """
+        if not isinstance(params, dict):
+            return [f"参数必须是对象类型，当前收到的是 {type(params).__name__}"]
+        schema = self.parameters or {}
+        if schema.get("type", "object") != "object":
+            raise ValueError(f"工具参数的 Schema 根类型必须是 object")
+        return self._validate(params, {**schema, "type": "object"}, "")
+
+
+    def to_schema(self) -> dict[str, Any]:
+        """把工具元信息转换为类似 OpenAI 函数调用所需的描述字典。"""
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.parameters,
+            },
+        }
+
+
     def _cast_object(self, obj: Any, schema: dict[str, Any]) -> dict[str, Any]:
+        """按对象 schema 转换字典参数值。"""
         # 如果传入不是字典结构，无法按 properties 转换，原样返回
         if not isinstance(obj, dict):
             return obj
@@ -139,20 +211,6 @@ class Tool(ABC):
         return val
 
 
-    def validate_params(self, params: dict[str, Any]) -> list[str]:
-        """验证参数是否符合 `parameters` schema，返回错误消息列表（空表示通过）。
-
-        基本规则：传入参数必须是 dict，且 schema 的根类型应为 object。
-        具体校验通过 `_validate` 递归完成。
-        """
-        if not isinstance(params, dict):
-            return [f"参数必须是对象类型，当前收到的是 {type(params).__name__}"]
-        schema = self.parameters or {}
-        if schema.get("type", "object") != "object":
-            raise ValueError(f"工具参数的 Schema 根类型必须是 object")
-        return self._validate(params, {**schema, "type": "object"}, "")
-
-
     def _validate(self, val: Any, schema: dict[str, Any], path: str) -> list[str]:
         """递归校验单个值或对象是否满足 schema，返回错误列表。
 
@@ -196,6 +254,12 @@ class Tool(ABC):
             if not isinstance(val, dict):
                 return errors
             props = schema.get("properties", {})
+
+            if "minProperties" in schema and len(val) < schema["minProperties"]:
+                errors.append(f"{label} 至少需要 {schema['minProperties']} 个字段")
+            if "maxProperties" in schema and len(val) > schema["maxProperties"]:
+                errors.append(f"{label} 不能超过 {schema['maxProperties']} 个字段")
+
             for k in schema.get("required", []):
                 if k not in val:
                     errors.append(f"缺少必填字段：{path + '.' + k if path else k}")
@@ -205,19 +269,25 @@ class Tool(ABC):
 
         # 数组项的逐一校验
         if t == "array" and "items" in schema and isinstance(val, list):
+            if "minItems" in schema and len(val) < schema["minItems"]:
+                errors.append(f"{label} 至少需要 {schema['minItems']} 项")
+            if "maxItems" in schema and len(val) > schema["maxItems"]:
+                errors.append(f"{label} 不能超过 {schema['maxItems']} 项")
+
+            unique_by = schema.get("x-uniqueBy")
+            if isinstance(unique_by, str):
+                seen_values: set[Any] = set()
+                for i, item in enumerate(val):
+                    if not isinstance(item, dict):
+                        continue
+                    unique_value = item.get(unique_by)
+                    if unique_value is None:
+                        continue
+                    if unique_value in seen_values:
+                        errors.append(f"{label}[{i}].{unique_by} 不能重复：{unique_value}")
+                    seen_values.add(unique_value)
+
             for i, item in enumerate(val):
                 errors.extend(self._validate(item, schema["items"], f"{path}[{i}]" if path else f"[{i}]"))
 
         return errors
-
-
-    def to_schema(self) -> dict[str, Any]:
-        """把工具元信息转换为类似 OpenAI 函数调用所需的描述字典。"""
-        return {
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "description": self.description,
-                "parameters": self.parameters,
-            },
-        }

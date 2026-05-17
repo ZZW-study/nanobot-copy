@@ -211,7 +211,8 @@ def agent(
     """启动与 ZBot 的对话。"""
 
     from loguru import logger  
-    from ZBot.agent.loop import AgentLoop        
+    from ZBot.agent.core_agent import CoreAgent       
+    from ZBot.config.agent_runtime import AgentRuntimeConfig
     from ZBot.config.loader import load_config   
     from ZBot.cron.service import CronService    
 
@@ -239,34 +240,31 @@ def agent(
     cron_store_path = get_runtime_subdir("cron") / "jobs.json"
     cron = CronService(cron_store_path, on_job=_on_cron_job)
 
-    # 创建 AgentLoop 实例
-    agent_loop = AgentLoop(
+    
+    runtime_config = AgentRuntimeConfig.from_app_config(
+        config=config,
+        model=provider.default_model,
+    )
+    
+    # 创建 CoreAgent 实例
+    core_agent = CoreAgent(
         provider=provider,                    # LLM 提供商
-        workspace=config.workspace_path,      # 工作区目录
-        model=provider.default_model,         # 使用的模型
-        temperature=config.temperature,       # 采样温度（控制随机性）
-        max_tokens=config.max_tokens,               # 最大输出 token 数
-        max_iterations=config.max_tool_iterations,  # 工具调用最大迭代次数
-        memory_window=config.memory_window,         # 记忆窗口大小（保留历史条数）
-        reasoning_effort=config.reasoning_effort,   # 推理强度参数
-        web_search_config=config.tools.web.search,  # 网页搜索配置
-        web_proxy=config.tools.web.proxy or None,   # 网页代理
-        score_threshold=config.score_threshold,     # 记忆召回分数阈值
-        exec_config=config.tools.exec,        # Shell 执行配置
+        runtime_config=runtime_config,        # 从全局配置派生的 Agent 运行时配置
         cron_service=cron,                    # 定时任务服务
-        restrict_to_workspace=config.tools.restrict_to_workspace,  # 是否限制工作区
-        mcp_servers=config.tools.mcp_servers, # MCP 服务器配置
     )
 
     # 思考状态显示上下文
     def _thinking_ctx():
+        """返回 CLI 思考状态的显示上下文。"""
         return console.status("[bold green] 🤖 ZBot 正在思考...[/bold green]", spinner="dots") # 返回上下文对象
 
 
-    # 进度回调函数：在 CLI 中显示工具调用进度，* 后面的参数必须使用关键字形式传递
-    async def _cli_progress(content: str, *, tool_hint: bool = False) -> None:
+    # 进度回调函数：在 CLI 中显示工具调用进度（就是打印一下而已，没什么神奇的），* 后面的参数必须使用关键字形式传递
+    async def _cli_progress(content: str, *, tool_hint: bool = False, agent_label: str | None = None) -> None:
+        """把 Agent 或工具执行进度输出到 CLI。"""
+        label = agent_label or "主agent"
         prefix = "正在调用工具：" if tool_hint else "进度："
-        console.print(f"[bold green]↳ {prefix}{content}[/bold green]")
+        console.print(f"[bold green]↳ {label} {prefix}{content}[/bold green]")
 
 
     # ========== 单次模式：传入 -m 参数 ==========
@@ -277,7 +275,7 @@ def agent(
             await cron.start()
             with _thinking_ctx():  # 显示思考状态
                 # 处理用户消息并获取 AI 回复
-                response = await agent_loop.process_direct(
+                response = await core_agent.process_message(
                     message,
                     session_name,
                     on_progress=_cli_progress
@@ -285,9 +283,9 @@ def agent(
             _print_agent_response(response)
             # 停止调度器并关闭 MCP 连接
             cron.stop()
-            await agent_loop.close_mcp()
-            await agent_loop.consolidate_all_session_memory(session_name=session_name)
-            await agent_loop.consolidate_daily_memory(session_name=session_name) 
+            await core_agent.close_mcp()
+            await core_agent.consolidate_all_session_memory(session_name=session_name)
+            await core_agent.consolidate_daily_memory(session_name=session_name) 
 
         asyncio.run(run_once())     
         return                      # 单次模式执行完毕直接返回
@@ -296,13 +294,6 @@ def agent(
     _init_prompt_session()     # 初始化终端输入会话
     console.print(f"{__logo__} 已进入交互模式（输入 [bold]exit[/bold] 或按 [bold]Ctrl+C[/bold] 结束）\n")
 
-    # 信号处理函数：优雅处理 Ctrl+C
-    def _handle_signal(_signum, _frame):
-        """处理 Ctrl+C 信号，优雅退出"""
-        console.print("\n程序退出。")
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, _handle_signal)  # Ctrl+C
 
     # 交互模式主循环
     async def run_interactive() -> None:
@@ -330,7 +321,7 @@ def agent(
 
                     # 处理用户消息并获取 AI 回复
                     with _thinking_ctx():
-                        response = await agent_loop.process_direct(
+                        response = await core_agent.process_message(
                             command,
                             session_name,
                             on_progress=_cli_progress
@@ -345,11 +336,12 @@ def agent(
                     # Ctrl+D 或管道结束
                     console.print("\n再见！")
                     break
+                
         finally:
             cron.stop()
-            await agent_loop.close_mcp()
-            await agent_loop.consolidate_all_session_memory(session_name=session_name)  # 退出前进行最终的会话归档
-            await agent_loop.consolidate_daily_memory(session_name=session_name) 
+            await core_agent.close_mcp()
+            await core_agent.consolidate_all_session_memory(session_name=session_name)  # 退出前进行最终的会话归档
+            await core_agent.consolidate_daily_memory(session_name=session_name) 
 
     asyncio.run(run_interactive())  # 启动交互循环
 

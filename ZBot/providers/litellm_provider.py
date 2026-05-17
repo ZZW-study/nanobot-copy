@@ -48,7 +48,7 @@ import litellm
 from litellm import acompletion                 # async，调用大模型，返回回答
 from loguru import logger 
 
-from ZBot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from ZBot.providers.base import DEFAULT_CONTEXT_WINDOW, LLMProvider, LLMResponse, ToolCallRequest
 from ZBot.providers.registry import find_by_model, find_gateway
 from ZBot.providers.registry import ProviderSpec
 
@@ -78,6 +78,7 @@ class LiteLLMProvider(LLMProvider):
             default_model: str = "GLM-5.0-Pro",  # 默认模型名称
             provider_name: str | None = None,        
     ):
+        """创建或复用 LiteLLM 提供商单例。"""
         if cls._instance is None:
             cls._instance = super().__new__(cls) # 创建了实例，并赋值给了cls的_instance属性，如果再次cls._instance.某某 = 某某，就是在给实例写属性
             # 初始化父类（API密钥/地址）
@@ -95,39 +96,16 @@ class LiteLLMProvider(LLMProvider):
             litellm.drop_params = True          # 自动删除不支持的参数
         return cls._instance   # 返回实例对象
 
-
-    def _resolve_model(self, model: str) -> str:
-        """
-        模型名称标准化：根据注册表自动添加前缀，便于litellm使用。
-        """
-        if self._gateway is not None:
-            # 网关模式：保证路由到网关内部的模型池
-            model = f"{self._gateway.litellm_prefix}/{model}"
-            return model
-
-        # 标准厂商：自动添加前缀
-        elif self._std_provider is not None:
-            model = f"{self._std_provider.litellm_prefix}/{model}"
-            return model
-
-        raise ValueError(f"无法解析模型名称 '{model}'，请检查配置是否正确，或模型名称是否包含已注册的关键词。")
-    
-
-    @staticmethod
-    def _sanitize_messages(messages: list[dict[str, Any]], extra_keys: frozenset[str] = frozenset()) -> list[dict[str, Any]]:
-        """
-        消息最终清洗：
-        1. 保留标准+厂商专属字段
-        2. 移除 tool 消息中的 name 字段（OpenAI 兼容 API 不接受）
-        """
-        allowed = _ALLOWED_MSG_KEYS | extra_keys
-        sanitized = LLMProvider._sanitize_request_messages(messages, allowed)
-
-        for clean in sanitized:
-            # OpenAI 兼容 API 的 tool 消息不应包含 name 字段
-            if clean.get("role") == "tool":
-                clean.pop("name", None)
-        return sanitized
+    def __init__(
+        self,
+        api_key: str | None = None,
+        api_base: str | None = None,
+        default_model: str = "GLM-5.0-Pro",
+        provider_name: str | None = None,
+    ):
+        """匹配 __new__ 的参数签名，避免实例化时落到父类 __init__ 报多余参数。"""
+        # 实际初始化在 __new__ 中完成；这里保留空实现是为了兼容现有单例写法。
+        pass
 
 
     async def chat(
@@ -176,6 +154,57 @@ class LiteLLMProvider(LLMProvider):
                 content=f"调用大模型失败：{str(e)}",
                 finish_reason="error",
             )
+
+    def get_context_window(self, model: str | None = None) -> int:
+        """优先读取 LiteLLM 的模型元数据，失败时回退到 128K。"""
+        target_model = model or self.default_model
+        try:
+            resolved_model = self._resolve_model(target_model)
+            info = litellm.get_model_info(resolved_model)
+        except Exception:
+            logger.debug("无法读取模型 {} 的上下文窗口，使用默认值 {}", target_model, DEFAULT_CONTEXT_WINDOW)
+            return DEFAULT_CONTEXT_WINDOW
+
+        for key in ("max_input_tokens", "max_context_tokens", "max_tokens"):
+            value = info.get(key)
+            if isinstance(value, int) and value > 0:
+                return value
+        return DEFAULT_CONTEXT_WINDOW
+
+
+
+    def _resolve_model(self, model: str) -> str:
+        """
+        模型名称标准化：根据注册表自动添加前缀，便于litellm使用。
+        """
+        if self._gateway is not None:
+            # 网关模式：保证路由到网关内部的模型池
+            model = f"{self._gateway.litellm_prefix}/{model}"
+            return model
+
+        # 标准厂商：自动添加前缀
+        elif self._std_provider is not None:
+            model = f"{self._std_provider.litellm_prefix}/{model}"
+            return model
+
+        raise ValueError(f"无法解析模型名称 '{model}'，请检查配置是否正确，或模型名称是否包含已注册的关键词。")
+    
+
+    @staticmethod
+    def _sanitize_messages(messages: list[dict[str, Any]], extra_keys: frozenset[str] = frozenset()) -> list[dict[str, Any]]:
+        """
+        消息最终清洗：
+        1. 保留标准+厂商专属字段
+        2. 移除 tool 消息中的 name 字段（OpenAI 兼容 API 不接受）
+        """
+        allowed = _ALLOWED_MSG_KEYS | extra_keys
+        sanitized = LLMProvider._sanitize_request_messages(messages, allowed)
+
+        for clean in sanitized:
+            # OpenAI 兼容 API 的 tool 消息不应包含 name 字段
+            if clean.get("role") == "tool":
+                clean.pop("name", None)
+        return sanitized
 
 
 

@@ -104,19 +104,42 @@ class SkillsLoader:
         builtin_skills_dir: Path | None = None,
         user_skills_dir: Path | None = None,
     ):
+        """初始化技能加载目录和缓存状态。"""
         self.builtin_skills_dir = builtin_skills_dir or BUILTIN_SKILLS_DIR
         self.user_skills_dir = user_skills_dir or (Path.home() / ".ZBot" / "skills")
         self.workspace_skills_dir = workspace / "skills" if workspace else None
         self._registry_cache: dict[str, SkillManifest] | None = None
 
-    def _iter_sources(self) -> list[tuple[str, Path]]:
-        """返回所有要扫描的技能目录。"""
-        sources: list[tuple[str, Path]] = [("builtin", self.builtin_skills_dir)]
-        if self.user_skills_dir:
-            sources.append(("user", self.user_skills_dir))
-        if self.workspace_skills_dir:
-            sources.append(("workspace", self.workspace_skills_dir))
-        return sources
+    def build_catalog_for_prompt(self) -> str:
+        """构建技能目录摘要，注入到 system prompt。"""
+        skills = self.list_skills()
+        if not skills:
+            return ""
+
+        lines = [
+            "以下是当前可用的技能目录。",
+            "根据技能描述判断是否需要；需要时读取对应 SKILL.md 正文。",
+            "",
+        ]
+
+        for manifest in skills:
+            lines.append(
+                f"- `{manifest.name}`：{manifest.description}（路径：{manifest.skill_file}）"
+            )
+
+        return "\n".join(lines)
+
+    def list_skills(self) -> list[SkillManifest]:
+        """列出所有技能，按名称排序。"""
+        skills = list(self._registry().values())
+        skills.sort(key=lambda item: item.name)
+        return skills
+
+    def _registry(self) -> dict[str, SkillManifest]:
+        """返回缓存的技能注册表。"""
+        if self._registry_cache is None:
+            self._registry_cache = self._discover_registry()
+        return self._registry_cache
 
     def _discover_registry(self) -> dict[str, SkillManifest]:
         """扫描所有目录，构建技能注册表。"""
@@ -143,33 +166,11 @@ class SkillsLoader:
 
         return registry
 
-    def _registry(self) -> dict[str, SkillManifest]:
-        """返回缓存的技能注册表。"""
-        if self._registry_cache is None:
-            self._registry_cache = self._discover_registry()
-        return self._registry_cache
-
-    def list_skills(self) -> list[SkillManifest]:
-        """列出所有技能，按名称排序。"""
-        skills = list(self._registry().values())
-        skills.sort(key=lambda item: item.name)
-        return skills
-
-    def build_catalog_for_prompt(self) -> str:
-        """构建技能目录摘要，注入到 system prompt。"""
-        skills = self.list_skills()
-        if not skills:
-            return ""
-
-        lines = [
-            "以下是当前可用的技能目录。",
-            "根据技能描述判断是否需要；需要时读取对应 SKILL.md 正文。",
-            "",
-        ]
-
-        for manifest in skills:
-            lines.append(
-                f"- `{manifest.name}`：{manifest.description}（路径：{manifest.skill_file}）"
-            )
-
-        return "\n".join(lines)
+    def _iter_sources(self) -> list[tuple[str, Path]]:
+        """返回所有要扫描的技能目录。"""
+        sources: list[tuple[str, Path]] = [("builtin", self.builtin_skills_dir)]
+        if self.user_skills_dir:
+            sources.append(("user", self.user_skills_dir))
+        if self.workspace_skills_dir:
+            sources.append(("workspace", self.workspace_skills_dir))
+        return sources

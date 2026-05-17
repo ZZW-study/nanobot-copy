@@ -83,14 +83,14 @@ class SessionMemoryStore:
         provider: LLMProvider,
         model: str,
         *,
-        memory_window: int = 25,
+        keep_recent_tokens: int = 16_000,
         consolidate_all: bool = False,
     ) -> bool:
         """
         每次对话的时候进行归档，把会话中的旧消息归档进会话记忆。
         """
         # 确定本次要归档的消息区间和需要保留的尾部消息数量
-        messages, keep_count = self._messages_to_archive(session, memory_window,consolidate_all)
+        messages, keep_count = self._messages_to_archive(session, keep_recent_tokens, consolidate_all)
         if not messages:
             return True  # 没有消息需要归档，直接返回成功
 
@@ -149,41 +149,6 @@ class SessionMemoryStore:
 
 
 
-    async def _read_session_memory(self) -> str:
-        """读取会话记忆全文（给合并用的）；文件不存在时返回空字符串。"""
-        if not self.memory_file.exists():
-            return ""
-        return await asyncio.to_thread(self.memory_file.read_text, encoding="utf-8")
-
-    @staticmethod
-    def _messages_to_archive(
-        session: Session,
-        memory_window: int,
-        consolidate_all: bool = False,
-    ) -> tuple[list[dict[str, Any]], int]:
-        """
-        确定本次归档的消息区间，以及本轮需要保留多少尾部消息。
-        """
-        if consolidate_all:
-            return session.messages[session.last_consolidated :], 0  # 归档所有剩余消息，不保留尾部
-            
-        # 保留最近 memory_window 条消息
-        # 这样下一轮 get_history(max_messages=memory_window) 能返回完整的历史
-        keep_count = memory_window
-        if len(session.messages) <= keep_count:
-            # 消息总数不超过保留数量，无需归档
-            return [], keep_count
-
-        # 计算归档范围：从上次归档位置到倒数 keep_count 条消息
-        start = session.last_consolidated  # 上次归档结束的位置
-        end = len(session.messages) - keep_count  # 保留尾部 keep_count 条
-        if end <= start:
-            # 归档范围无效（已经归档过了），无需归档
-            return [], keep_count
-
-        # 返回要归档的消息片段和保留数量
-        return session.messages[start:end], keep_count
-
     def _build_prompt(self, current_memory: str, messages: list[dict[str, Any]]) -> str:
         """把会话记忆和待归档对话整理成提示词。"""
         # 格式化消息列表为转录文本
@@ -210,4 +175,65 @@ class SessionMemoryStore:
             f"{transcript}"
         )
 
+    @staticmethod
+    def _messages_to_archive(
+        session: Session,
+        keep_recent_tokens: int,
+        consolidate_all: bool = False,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """
+        确定本次归档的消息区间，以及本轮需要保留多少尾部消息。
+        """
+        if consolidate_all:
+            return session.messages[session.last_consolidated :], 0  # 归档所有剩余消息，不保留尾部
+
+        # 归档是会话记忆维护；尾部按 token 保留原文，避免近期细节只剩摘要。
+        keep_count = SessionMemoryStore._count_recent_messages_by_token(
+            session.messages,
+            keep_recent_tokens,
+        )
+        if len(session.messages) <= keep_count:
+            # 消息总数不超过保留数量，无需归档
+            return [], keep_count
+
+        # 计算归档范围：从上次归档位置到倒数 keep_count 条消息
+        start = session.last_consolidated  # 上次归档结束的位置
+        end = len(session.messages) - keep_count  # 保留尾部 keep_count 条
+        if end <= start:
+            # 归档范围无效（已经归档过了），无需归档
+            return [], keep_count
+
+        # 返回要归档的消息片段和保留数量
+        return session.messages[start:end], keep_count
+
+    @staticmethod
+    def _count_recent_messages_by_token(messages: list[dict[str, Any]], token_budget: int) -> int:
+        """从尾部开始按 token 预算计算要保留的最近原文消息数量。"""
+        used_tokens = 0
+        keep_count = 0
+        for message in reversed(messages):
+            cost = SessionMemoryStore._estimate_message_tokens(message)
+            if keep_count and used_tokens + cost > token_budget:
+                break
+            keep_count += 1
+            used_tokens += cost
+        return keep_count
+
+    @staticmethod
+    def _estimate_message_tokens(message: dict[str, Any]) -> int:
+        """粗略估算消息 token，避免为归档引入 tokenizer 依赖。"""
+        import json
+
+        total_chars = len(str(message.get("role", ""))) + len(str(message.get("content", "")))
+        if "tool_calls" in message:
+            total_chars += len(json.dumps(message["tool_calls"], ensure_ascii=False))
+        if "tool_call_id" in message:
+            total_chars += len(str(message["tool_call_id"]))
+        return max(1, total_chars // 2)
+
+    async def _read_session_memory(self) -> str:
+        """读取会话记忆全文（给合并用的）；文件不存在时返回空字符串。"""
+        if not self.memory_file.exists():
+            return ""
+        return await asyncio.to_thread(self.memory_file.read_text, encoding="utf-8")
 

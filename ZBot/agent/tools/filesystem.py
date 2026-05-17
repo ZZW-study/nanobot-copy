@@ -4,7 +4,7 @@ import difflib
 from pathlib import Path
 from typing import Any
 
-from ZBot.agent.tools.base import Tool
+from ZBot.agent.tools.base import Tool, format_tool_error
 
 
 def _resolve_path(
@@ -44,6 +44,42 @@ def _is_under(path: Path, directory: Path) -> bool:
         return False
 
 
+def _preview_dir(path: Path, limit: int = 8) -> str:
+    """返回目录下少量条目，给失败结果提供可行动线索。"""
+    if not path.exists() or not path.is_dir():
+        return ""
+    try:
+        names = sorted(item.name + ("/" if item.is_dir() else "") for item in path.iterdir())
+    except OSError:
+        return ""
+    if not names:
+        return "目录为空"
+    preview = ", ".join(names[:limit])
+    if len(names) > limit:
+        preview += f", ...（共 {len(names)} 项）"
+    return preview
+
+
+def _path_failure_hint(path: str, resolved: Path, *, expected: str, workspace: Path | None) -> str:
+    """为路径类失败生成观察信息。"""
+    parent = resolved.parent
+    parts = [
+        f"请求路径：{path}",
+        f"解析后路径：{resolved}",
+    ]
+    if workspace is not None:
+        parts.append(f"工作区：{workspace}")
+    parts.append(f"期望类型：{expected}")
+    if parent.exists():
+        parts.append(f"父目录存在：{parent}")
+        preview = _preview_dir(parent)
+        if preview:
+            parts.append(f"父目录条目预览：{preview}")
+    else:
+        parts.append(f"父目录不存在：{parent}")
+    return "；".join(parts)
+
+
 class ReadFileTool(Tool):
     """读取文件内容"""
 
@@ -51,19 +87,23 @@ class ReadFileTool(Tool):
     _DEFAULT_LIMIT = 2000  # 默认读取行数
 
     def __init__(self, workspace: Path | None = None, allowed_dir: Path | None = None):
+        """初始化读取工具的工作区和访问边界。"""
         self._workspace = workspace         # 工作区根目录
         self._allowed_dir = allowed_dir     # 允许访问的目录
 
     @property
     def name(self) -> str:
+        """返回读取文件工具名称。"""
         return "read_file"
 
     @property
     def description(self) -> str:
+        """返回读取文件工具说明。"""
         return "读取文件内容。可使用 offset 和 limit 分页读取大文件。"
 
     @property
     def parameters(self) -> dict[str, Any]:
+        """返回读取文件工具参数 Schema。"""
         return {
             "type": "object",
             "properties": {
@@ -75,18 +115,32 @@ class ReadFileTool(Tool):
         }
 
     async def execute(self, **kwargs: Any) -> str:
+        """读取指定文件内容并按需分页返回。"""
         try:
             # 解析路径并检查是否在允许范围内
-            path = kwargs.get("path", "")
-            offset = kwargs.get("offset", 1)
+            path: str = kwargs.get("path", "")
+            offset: int = kwargs.get("offset", 1)
             limit = kwargs.get("limit", None)
             fp = _resolve_path(path, self._workspace, self._allowed_dir)
             # 检查文件是否存在
             if not fp.exists():
-                return f"错误：文件不存在：{path}"
+                return format_tool_error(
+                    "文件不存在",
+                    attempted=f"读取文件 {path}",
+                    observed=_path_failure_hint(path, fp, expected="文件", workspace=self._workspace),
+                    do_not_repeat=f"不要继续用相同路径调用 read_file：{path}",
+                    next_action=f"先调用 list_dir 查看父目录：{fp.parent}",
+                )
             # 检查是否为普通文件（非目录）
             if not fp.is_file():
-                return f"错误：目标不是文件：{path}"
+                next_action = f"如果要查看目录内容，请调用 list_dir：{path}" if fp.is_dir() else "请确认目标路径类型"
+                return format_tool_error(
+                    "目标不是文件",
+                    attempted=f"读取文件 {path}",
+                    observed=_path_failure_hint(path, fp, expected="文件", workspace=self._workspace),
+                    do_not_repeat=f"不要继续用 read_file 读取该路径：{path}",
+                    next_action=next_action,
+                )
 
             # 读取文件全部行
             all_lines = fp.read_text(encoding="utf-8").splitlines()   
@@ -108,7 +162,13 @@ class ReadFileTool(Tool):
                 return f"（空文件：{path}）"
             # offset 超出总行数则返回错误
             if offset > total:
-                return f"错误：起始行号 {offset} 超出了文件末尾（总行数 {total}）"
+                return format_tool_error(
+                    "起始行号超出文件末尾",
+                    attempted=f"读取 {path} 的第 {offset} 行起",
+                    observed=f"文件总行数为 {total}",
+                    do_not_repeat=f"不要继续使用 offset={offset} 读取该文件",
+                    next_action="改用更小的 offset，或根据已读取内容继续分析",
+                )
 
             # 计算实际读取范围（offset 是 1 索引，需减 1）
             start = offset - 1
@@ -137,28 +197,42 @@ class ReadFileTool(Tool):
             return result
 
         except PermissionError as e:
-            return f"错误：{e}"
+            return format_tool_error(
+                str(e),
+                attempted=f"读取文件 {kwargs.get('path', '')}",
+                do_not_repeat="不要重复访问同一路径",
+                next_action="改用工作区内允许访问的路径，或先 list_dir 确认可访问目录",
+            )
         except Exception as e:
-            return f"错误：读取文件失败：{e}"
+            return format_tool_error(
+                f"读取文件失败：{e}",
+                attempted=f"读取文件 {kwargs.get('path', '')}",
+                do_not_repeat="不要用相同参数重复读取",
+                next_action="先确认路径、编码和文件类型；必要时改用 list_dir 定位文件",
+            )
 
 
 class WriteFileTool(Tool):
     """写入文件"""
 
     def __init__(self, workspace: Path | None = None, allowed_dir: Path | None = None):
+        """初始化写入工具的工作区和访问边界。"""
         self._workspace = workspace  # 工作区根目录
         self._allowed_dir = allowed_dir  # 允许访问的目录
 
     @property
     def name(self) -> str:
+        """返回写入文件工具名称。"""
         return "write_file"
 
     @property
     def description(self) -> str:
+        """返回写入文件工具说明。"""
         return "将内容写入文件，自动创建父目录。"
 
     @property
     def parameters(self) -> dict[str, Any]:
+        """返回写入文件工具参数 Schema。"""
         return {
             "type": "object",
             "properties": {
@@ -169,6 +243,7 @@ class WriteFileTool(Tool):
         }
 
     async def execute(self, **kwargs: Any) -> str:
+        """把指定内容写入目标文件。"""
         path = kwargs.get("path", "")
         content = kwargs.get("content", "")
         try:
@@ -180,9 +255,19 @@ class WriteFileTool(Tool):
             fp.write_text(content, encoding="utf-8")
             return f"已成功写入文件：{fp}（共 {len(content)} 个字符）"
         except PermissionError as e:
-            return f"错误：{e}"
+            return format_tool_error(
+                str(e),
+                attempted=f"写入文件 {path}",
+                do_not_repeat="不要重复写入同一路径",
+                next_action="改用工作区内允许写入的路径",
+            )
         except Exception as e:
-            return f"错误：写入文件失败：{e}"
+            return format_tool_error(
+                f"写入文件失败：{e}",
+                attempted=f"写入文件 {path}",
+                do_not_repeat="不要用相同参数重复写入",
+                next_action="检查父目录、权限和内容大小后再决定是否重试",
+            )
 
 
 def _find_match(content: str, old_text: str) -> tuple[str | None, int]:
@@ -220,19 +305,23 @@ class EditFileTool(Tool):
     """编辑文件（查找并替换文本）"""
 
     def __init__(self, workspace: Path | None = None, allowed_dir: Path | None = None):
+        """初始化编辑工具的工作区和访问边界。"""
         self._workspace = workspace  # 工作区根目录
         self._allowed_dir = allowed_dir  # 允许访问的目录
 
     @property
     def name(self) -> str:
+        """返回编辑文件工具名称。"""
         return "edit_file"
 
     @property
     def description(self) -> str:
+        """返回编辑文件工具说明。"""
         return "编辑文件，将 old_text 替换为 new_text。支持轻微的空白差异。设置 replace_all=true 可替换所有出现。"
 
     @property
     def parameters(self) -> dict[str, Any]:
+        """返回编辑文件工具参数 Schema。"""
         return {
             "type": "object",
             "properties": {
@@ -247,6 +336,7 @@ class EditFileTool(Tool):
     async def execute(
         self, **kwargs: Any
     ) -> str:
+        """查找并替换文件中的指定文本。"""
         path = kwargs.get("path", "")
         old_text = kwargs.get("old_text", "")
         new_text = kwargs.get("new_text", "")
@@ -257,7 +347,13 @@ class EditFileTool(Tool):
             fp = _resolve_path(path, self._workspace, self._allowed_dir)
             # 检查文件是否存在
             if not fp.exists():
-                return f"错误：文件不存在：{path}"
+                return format_tool_error(
+                    "文件不存在",
+                    attempted=f"编辑文件 {path}",
+                    observed=_path_failure_hint(path, fp, expected="文件", workspace=self._workspace),
+                    do_not_repeat=f"不要继续编辑不存在的路径：{path}",
+                    next_action=f"先调用 list_dir 查看父目录：{fp.parent}",
+                )
 
             # 以二进制读取，返回字节串（bytes），检测换行符类型（CRLF 还是 LF）
             raw = fp.read_bytes()
@@ -290,9 +386,19 @@ class EditFileTool(Tool):
             return f"已成功编辑文件：{fp}"
 
         except PermissionError as e:
-            return f"错误：{e}"
+            return format_tool_error(
+                str(e),
+                attempted=f"编辑文件 {path}",
+                do_not_repeat="不要重复编辑同一路径",
+                next_action="改用工作区内允许访问的路径",
+            )
         except Exception as e:
-            return f"错误：编辑文件失败：{e}"
+            return format_tool_error(
+                f"编辑文件失败：{e}",
+                attempted=f"编辑文件 {path}",
+                do_not_repeat="不要用相同参数重复编辑",
+                next_action="先 read_file 确认当前内容，再构造更准确的 old_text",
+            )
 
     @staticmethod
     def _not_found_msg(old_text: str, content: str, path: str) -> str:
@@ -317,8 +423,20 @@ class EditFileTool(Tool):
                 tofile=f"{path}（文件实际内容，第 {best_start + 1} 行起）",
                 lineterm="",
             ))
-            return f"错误：在 {path} 中找不到 old_text。\n最接近的片段位于第 {best_start + 1} 行起（相似度 {best_ratio:.0%}）：\n{diff}"
-        return f"错误：在 {path} 中找不到 old_text，且没有发现足够接近的片段。"
+            return format_tool_error(
+                "找不到 old_text",
+                attempted=f"在 {path} 中替换指定文本",
+                observed=f"最接近的片段位于第 {best_start + 1} 行起（相似度 {best_ratio:.0%}）：\n{diff}",
+                do_not_repeat="不要用相同 old_text 再次调用 edit_file",
+                next_action="先 read_file 查看目标行附近内容，再用文件中的精确文本重试",
+            )
+        return format_tool_error(
+            "找不到 old_text",
+            attempted=f"在 {path} 中替换指定文本",
+            observed="没有发现足够接近的片段",
+            do_not_repeat="不要用相同 old_text 再次调用 edit_file",
+            next_action="先 read_file 或搜索目标符号，确认当前文件内容后再编辑",
+        )
 
 
 class ListDirTool(Tool):
@@ -333,19 +451,23 @@ class ListDirTool(Tool):
     }
 
     def __init__(self, workspace: Path | None = None, allowed_dir: Path | None = None):
+        """初始化列目录工具的工作区和访问边界。"""
         self._workspace = workspace  # 工作区根目录
         self._allowed_dir = allowed_dir  # 允许访问的目录
 
     @property
     def name(self) -> str:
+        """返回列目录工具名称。"""
         return "list_dir"
 
     @property
     def description(self) -> str:
+        """返回列目录工具说明。"""
         return "列出目录内容。设置 recursive=true 可递归显示。常见噪声目录会被自动忽略。"
 
     @property
     def parameters(self) -> dict[str, Any]:
+        """返回列目录工具参数 Schema。"""
         return {
             "type": "object",
             "properties": {
@@ -359,6 +481,7 @@ class ListDirTool(Tool):
     async def execute(
         self, **kwargs: Any
     ) -> str:
+        """列出目录内容并按上限截断返回。"""
         path = kwargs.get("path", "")
         recursive = kwargs.get("recursive", False)
         max_entries = kwargs.get("max_entries", None)
@@ -368,10 +491,23 @@ class ListDirTool(Tool):
             dp = _resolve_path(path, self._workspace, self._allowed_dir)
             # 检查目录是否存在
             if not dp.exists():
-                return f"错误：目录不存在：{path}"
+                return format_tool_error(
+                    "目录不存在",
+                    attempted=f"列出目录 {path}",
+                    observed=_path_failure_hint(path, dp, expected="目录", workspace=self._workspace),
+                    do_not_repeat=f"不要继续用相同路径调用 list_dir：{path}",
+                    next_action=f"先列出存在的父目录：{dp.parent}",
+                )
             # 检查是否为目录
             if not dp.is_dir():
-                return f"错误：目标不是目录：{path}"
+                next_action = f"如果要读取文件，请调用 read_file：{path}" if dp.is_file() else "请确认目标路径类型"
+                return format_tool_error(
+                    "目标不是目录",
+                    attempted=f"列出目录 {path}",
+                    observed=_path_failure_hint(path, dp, expected="目录", workspace=self._workspace),
+                    do_not_repeat=f"不要继续用 list_dir 读取该路径：{path}",
+                    next_action=next_action,
+                )
 
             # 确定返回条目上限
             cap = max_entries or self._DEFAULT_MAX
@@ -413,6 +549,16 @@ class ListDirTool(Tool):
             return result
 
         except PermissionError as e:
-            return f"错误：{e}"
+            return format_tool_error(
+                str(e),
+                attempted=f"列出目录 {path}",
+                do_not_repeat="不要重复访问同一路径",
+                next_action="改用工作区内允许访问的目录",
+            )
         except Exception as e:
-            return f"错误：列出目录失败：{e}"
+            return format_tool_error(
+                f"列出目录失败：{e}",
+                attempted=f"列出目录 {path}",
+                do_not_repeat="不要用相同参数重复列目录",
+                next_action="检查路径是否存在、是否为目录，再决定下一步",
+            )

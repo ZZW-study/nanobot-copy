@@ -21,7 +21,7 @@ import re                           # 用于正则表达式匹配危险命令模
 from pathlib import Path  
 from typing import Any  
 
-from ZBot.agent.tools.base import Tool  
+from ZBot.agent.tools.base import Tool, format_tool_error
 
 
 class ExecTool(Tool):
@@ -81,14 +81,17 @@ class ExecTool(Tool):
 
     @property
     def name(self) -> str:
+        """返回 shell 执行工具名称。"""
         return "exec"
 
     @property
     def description(self) -> str:
+        """返回 shell 执行工具说明。"""
         return "执行 shell 命令并返回结果。使用前请确认命令安全且必要。"
 
     @property
     def parameters(self) -> dict[str, Any]:
+        """返回 shell 执行工具参数 Schema。"""
         return {
             "type": "object",  # 参数必须是一个对象，具体是什么对象，在参数里面定义，parameters 整体是一个对象
             "properties": {
@@ -144,7 +147,12 @@ class ExecTool(Tool):
 
         # 空命令检查
         if not command.strip():
-            return "错误：命令不能为空"
+            return format_tool_error(
+                "命令不能为空",
+                attempted="执行空 shell 命令",
+                do_not_repeat="不要再次用空 command 调用 exec",
+                next_action="提供明确的 shell 命令，或改用 read_file/list_dir 获取信息",
+            )
 
         cwd = working_dir or self.working_dir or os.getcwd()
 
@@ -179,7 +187,13 @@ class ExecTool(Tool):
                     await asyncio.wait_for(process.wait(), timeout=5.0)
                 except asyncio.TimeoutError:
                     pass  # 进程可能已经结束，忽略超时
-                return f"错误：命令执行超时（{effective_timeout} 秒）"
+                return format_tool_error(
+                    f"命令执行超时（{effective_timeout} 秒）",
+                    attempted=f"在 {cwd} 执行：{command}",
+                    observed="进程已被终止，未得到完整输出",
+                    do_not_repeat="不要用相同命令和相同超时时间重复执行",
+                    next_action="缩小命令范围、增加过滤条件，或改用更具体的文件/搜索工具",
+                )
 
             # 组装输出内容
             output_parts = []
@@ -211,7 +225,12 @@ class ExecTool(Tool):
 
         except Exception as exc:
             # 捕获其他异常（如命令不存在、权限不足等）
-            return f"错误：执行命令失败：{str(exc)}"
+            return format_tool_error(
+                f"执行命令失败：{str(exc)}",
+                attempted=f"在 {cwd} 执行：{command}",
+                do_not_repeat="不要用相同命令重复执行",
+                next_action="检查命令是否存在、工作目录是否正确，或改用更小的观察命令定位问题",
+            )
 
     def _guard_command(self, command: str, cwd: str) -> str | None:
         """
@@ -236,7 +255,13 @@ class ExecTool(Tool):
         for pattern in self.deny_patterns:
             if re.search(pattern, lower):
                 # 如果匹配到危险命令模式，拦截并返回错误
-                return "错误：命令被安全策略拦截，检测到高风险模式。"
+                return format_tool_error(
+                    "命令被安全策略拦截，检测到高风险模式",
+                    attempted=f"在 {cwd} 执行：{command}",
+                    observed=f"匹配危险命令规则：{pattern}",
+                    do_not_repeat="不要继续尝试执行相同或等价的高风险命令",
+                    next_action="改用只读观察命令，或使用受控的文件工具完成必要操作",
+                )
 
         # ========== 第二层：路径限制检查 ==========
         if self.restrict_to_workspace:
@@ -244,7 +269,13 @@ class ExecTool(Tool):
             # ../：Linux/macOS 系统的上级目录写法
             # ..\\：Windows 系统的上级目录写法（双反斜杠是 Python 转义写法）
             if "..\\" in cmd or "../" in cmd:
-                return "错误：命令被安全策略拦截，检测到路径穿越。"
+                return format_tool_error(
+                    "命令被安全策略拦截，检测到路径穿越",
+                    attempted=f"在 {cwd} 执行：{command}",
+                    observed="命令中包含 ../ 或 ..\\",
+                    do_not_repeat="不要继续用路径穿越访问工作区外内容",
+                    next_action="把目标路径改成工作区内路径，或先用 list_dir 确认可访问目录",
+                )
 
             # 获取工作目录的绝对路径
             cwd_path = Path(cwd).resolve()
@@ -263,7 +294,13 @@ class ExecTool(Tool):
                 if path.is_absolute() and (
                     cwd_path not in path.parents and path != cwd_path
                 ):
-                    return "错误：命令被安全策略拦截，访问路径超出了当前工作目录。"
+                    return format_tool_error(
+                        "命令被安全策略拦截，访问路径超出了当前工作目录",
+                        attempted=f"在 {cwd} 执行：{command}",
+                        observed=f"越界路径：{path}；当前工作目录：{cwd_path}",
+                        do_not_repeat="不要继续访问工作区外绝对路径",
+                        next_action="改用工作区内路径，或先 list_dir 当前工作目录确认可访问文件",
+                    )
 
         return None  # 所有检查通过，允许执行
 

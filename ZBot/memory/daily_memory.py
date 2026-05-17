@@ -101,9 +101,11 @@ class DailyMemoryStore:
     db: aiosqlite.Connection
 
     def __new__(cls,workspace_path: Path):
+        """创建或复用每日记忆存储单例。"""
         if cls._instance is None:
             cls._instance = super().__new__(cls)
             async def create_db(workspace_path: Path):
+                """初始化每日记忆数据库连接和表结构。"""
                 db: aiosqlite.Connection = await get_db(workspace_path)
                 await init_db(db)
             asyncio.run(create_db(workspace_path)) 
@@ -225,74 +227,6 @@ class DailyMemoryStore:
             raise Exception("升级有价值日常记忆失败")
 
 
-    async def _retrieve_daily_memory(self, user_content: str, score_threshold: float = 0.75) -> list[dict[str, Any]]:
-        """
-        基于向量相似度检索相关的每日记忆记录，并返回文本内容。
-        """
-        user_content_embeddings = serialize_float32(
-            await self._generate_daily_memory_vec(user_content.strip())
-        )
-
-        cursor = await self.db.execute(
-            """
-            WITH ranked AS(
-                SELECT rowid, distance
-                FROM daily_memory_vector
-                WHERE vector MATCH ?
-                AND 1 - distance >= ?
-            )
-
-            SELECT daily_memory.id, daily_memory.session_name, daily_memory.content, ranked.distance
-            FROM ranked
-            -- JOIN 是 SQL 中的一个关键字，用于把两张表按照某个条件关联起来，组合成一张查询结果。
-            -- 从 ranked 里拿到向量检索命中的 rowid，
-            -- 然后去 daily_memory 表里找 id 等于这个 rowid 的记录，
-            -- 最后把两边的数据拼在一起返回。
-            JOIN daily_memory ON daily_memory.id = ranked.rowid
-            ORDER BY ranked.distance ASC
-            """,
-            (user_content_embeddings, score_threshold)
-        )
-
-        results = await cursor.fetchall()
-        await cursor.close()
-
-        memories: list[dict[str, Any]] = []
-
-        try:
-            for result in results:
-                # sqlite-vec 返回的 distance 是余弦距离，需要转换成相似度
-                id = result["id"]
-                await self.db.execute(
-                    """
-                    UPDATE daily_memory
-                    SET recall_count = recall_count + 1
-                    WHERE id = ?
-                    """,
-                    (id,)
-                )
-
-                memories.append(
-                    {
-                        "session_name": result["session_name"],
-                        "content": result["content"],
-                    }
-                )
-
-            await self.db.commit()
-            return memories
-
-        except Exception:
-            await self.db.rollback()
-            raise
-
-
-
-    async def _generate_daily_memory_vec(self, content: str) -> list[float]:
-        """生成每日记忆的向量表示。"""
-        return embeddings.embed_query(content)
-
-
     async def _generate_daily_memory_text(self, provider: "LLMProvider", model: str, session: "Session") -> str:
         """调用大模型生成每日记忆文本。"""
         memory_snapshot = session.memory_snapshot or ""  # 只用记忆快照即可，因为如果没有生成记忆快照，说明之前没有生成过会话记忆，也就不用会话记忆，如果生成了记忆快照，会话记忆就是记忆快照了。
@@ -360,6 +294,71 @@ class DailyMemoryStore:
             "对话内容：\n"
             f"{formatted_messages}"
         )
+
+    async def _generate_daily_memory_vec(self, content: str) -> list[float]:
+        """生成每日记忆的向量表示。"""
+        return embeddings.embed_query(content)
+
+    async def _retrieve_daily_memory(self, user_content: str, score_threshold: float = 0.75) -> list[dict[str, Any]]:
+        """
+        基于向量相似度检索相关的每日记忆记录，并返回文本内容。
+        """
+        user_content_embeddings = serialize_float32(
+            await self._generate_daily_memory_vec(user_content.strip())
+        )
+
+        cursor = await self.db.execute(
+            """
+            WITH ranked AS(
+                SELECT rowid, distance
+                FROM daily_memory_vector
+                WHERE vector MATCH ?
+                AND 1 - distance >= ?
+            )
+
+            SELECT daily_memory.id, daily_memory.session_name, daily_memory.content, ranked.distance
+            FROM ranked
+            -- JOIN 是 SQL 中的一个关键字，用于把两张表按照某个条件关联起来，组合成一张查询结果。
+            -- 从 ranked 里拿到向量检索命中的 rowid，
+            -- 然后去 daily_memory 表里找 id 等于这个 rowid 的记录，
+            -- 最后把两边的数据拼在一起返回。
+            JOIN daily_memory ON daily_memory.id = ranked.rowid
+            ORDER BY ranked.distance ASC
+            """,
+            (user_content_embeddings, score_threshold)
+        )
+
+        results = await cursor.fetchall()
+        await cursor.close()
+
+        memories: list[dict[str, Any]] = []
+
+        try:
+            for result in results:
+                # sqlite-vec 返回的 distance 是余弦距离，需要转换成相似度
+                id = result["id"]
+                await self.db.execute(
+                    """
+                    UPDATE daily_memory
+                    SET recall_count = recall_count + 1
+                    WHERE id = ?
+                    """,
+                    (id,)
+                )
+
+                memories.append(
+                    {
+                        "session_name": result["session_name"],
+                        "content": result["content"],
+                    }
+                )
+
+            await self.db.commit()
+            return memories
+
+        except Exception:
+            await self.db.rollback()
+            raise
     
 
 # 全局单例

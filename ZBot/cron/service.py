@@ -99,6 +99,7 @@ class CronService:
         store_path: Path,
         on_job: Callable[[CronJob], Coroutine[Any, Any, Any]] | None = None,
     ):
+        """初始化定时任务存储路径和到期回调。"""
         self.store_path = store_path          # JSON 持久化文件路径
         self.on_job = on_job                  # 任务到期时的业务回调
         self._timer_task: asyncio.Task | None = None  # 当前挂起的计时器
@@ -162,34 +163,6 @@ class CronService:
             logger.info("定时任务已删除：{}", job_id)
         return removed
 
-    # ==================== 持久化 ====================
-
-    def _load_jobs(self) -> list[CronJob]:
-        """从 JSON 文件读取任务列表。文件不存在则返回空列表。"""
-        if not self.store_path.exists():
-            return []
-
-        try:
-            data = json.loads(self.store_path.read_text(encoding="utf-8"))
-            return [self._job_from_dict(item) for item in data.get("jobs", [])]
-        except Exception as exc:
-            logger.warning("读取定时任务存储失败：{}", exc)
-            return []
-
-    def _save_jobs(self, jobs: list[CronJob]) -> None:
-        """将任务列表写入 JSON 文件（覆盖写入）。"""
-        self.store_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"jobs": [self._job_to_dict(j) for j in jobs]}
-        self.store_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-
-    # ==================== 计时器调度 ====================
-
-    def _next_wake_ms(self) -> int | None:
-        """返回所有任务中最早的 next_run_at_ms，用于确定计时器要等多久。"""
-        jobs = self._load_jobs()
-        next_runs = [j.next_run_at_ms for j in jobs if j.next_run_at_ms is not None]
-        return min(next_runs) if next_runs else None
-
     def _arm_timer(self) -> None:
         """
         挂起一个异步计时器等待下一个任务到期。
@@ -209,6 +182,7 @@ class CronService:
         delay = max(0.0, (next_wake - _now_ms()) / 1000)
 
         async def tick() -> None:
+            """等待到期时间并触发定时任务检查。"""
             try:
                 await asyncio.sleep(delay)
             except asyncio.CancelledError:
@@ -217,6 +191,12 @@ class CronService:
                 await self._on_timer()
 
         self._timer_task = asyncio.create_task(tick())
+
+    def _next_wake_ms(self) -> int | None:
+        """返回所有任务中最早的 next_run_at_ms，用于确定计时器要等多久。"""
+        jobs = self._load_jobs()
+        next_runs = [j.next_run_at_ms for j in jobs if j.next_run_at_ms is not None]
+        return min(next_runs) if next_runs else None
 
     async def _on_timer(self) -> None:
         """计时器到期：找出所有到期任务逐个执行，然后重新 arm。"""
@@ -251,7 +231,25 @@ class CronService:
         # 循环任务（every/cron）：算出下一次触发时间，等下一轮计时器来执行
         job.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
 
-    # ==================== 序列化 ====================
+    # ==================== 持久化和序列化 ====================
+
+    def _load_jobs(self) -> list[CronJob]:
+        """从 JSON 文件读取任务列表。文件不存在则返回空列表。"""
+        if not self.store_path.exists():
+            return []
+
+        try:
+            data = json.loads(self.store_path.read_text(encoding="utf-8"))
+            return [self._job_from_dict(item) for item in data.get("jobs", [])]
+        except Exception as exc:
+            logger.warning("读取定时任务存储失败：{}", exc)
+            return []
+
+    def _save_jobs(self, jobs: list[CronJob]) -> None:
+        """将任务列表写入 JSON 文件（覆盖写入）。"""
+        self.store_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"jobs": [self._job_to_dict(j) for j in jobs]}
+        self.store_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
     @staticmethod
     def _job_from_dict(data: dict[str, Any]) -> CronJob:

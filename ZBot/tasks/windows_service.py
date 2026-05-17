@@ -13,6 +13,7 @@ class CeleryWorkerService(win32serviceutil.ServiceFramework):
     _svc_description_ = "Agent 记忆系统 Celery 后台服务（Worker+Beat），开机自启执行定时任务"
 
     def __init__(self, args):
+        """初始化 Windows 服务句柄和子进程状态。"""
         super().__init__(args)
         # 停止事件
         self.stop_event = win32event.CreateEvent(None, 0, 0, None)

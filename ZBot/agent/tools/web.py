@@ -9,7 +9,7 @@ import re
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse       # 导入 URL 解析模块，用于分解、拼接、验证 URL 
 import httpx                            # 导入 httpx 库，一个功能强大的 HTTP 客户端，支持同步和异步请求
-from ZBot.agent.tools.base import Tool
+from ZBot.agent.tools.base import Tool, format_tool_error
 
 # 类型检查块：仅在类型检查阶段导入 WebSearchConfig，避免运行时循环依赖
 if TYPE_CHECKING:
@@ -91,18 +91,26 @@ def _format_results(query: str, items: list[dict[str, Any]], n: int) -> str:
 class WebSearchTool(Tool):
     """网页搜索工具，支持 Bocha 和 Tavily"""
 
-    # 直接用 类属性 实现了抽象属性，可以。
+    def __init__(self, config: WebSearchConfig | None = None, proxy: str | None = None):
+        """初始化网页搜索配置和代理地址。"""
+        from ZBot.config.schema import WebSearchConfig
+
+        self.config = config if config is not None else WebSearchConfig()  # 使用传入配置或默认配置
+        self.proxy = proxy                                                 # HTTP 代理地址
     
     @property
     def name(self) -> str:
+        """返回网页搜索工具名称。"""
         return "web_search"
     
     @property
     def description(self) -> str:
+        """返回网页搜索工具说明。"""
         return " 使用 Bocha Search API 进行网页搜索，返回标题、URL 和摘要。"
     
     @property
     def parameters(self) -> dict[str, Any]:
+        """返回网页搜索工具参数 Schema。"""
         return {
             "type": "object",
             "properties": {
@@ -113,14 +121,8 @@ class WebSearchTool(Tool):
         }
 
 
-    def __init__(self, config: WebSearchConfig | None = None, proxy: str | None = None):
-        from ZBot.config.schema import WebSearchConfig
-        
-        self.config = config if config is not None else WebSearchConfig()  # 使用传入配置或默认配置
-        self.proxy = proxy                                                 # HTTP 代理地址
-
-
     async def execute(self, **kwargs: Any) -> str:
+        """执行网页搜索并返回格式化结果。"""
 
         query = kwargs.get("query","")
         query = str(query).strip()
@@ -135,7 +137,13 @@ class WebSearchTool(Tool):
         # 从配置获取 API 密钥
         api_key = self.config.api_key 
         if not api_key:
-            return "错误：未设置 BOCHA_API_KEY。请在配置文件或环境变量中配置它。"
+            return format_tool_error(
+                "未设置 BOCHA_API_KEY",
+                attempted=f"搜索：{query}",
+                observed="当前搜索提供商需要 API Key，但配置中没有可用密钥",
+                do_not_repeat="不要继续用相同配置调用 web_search",
+                next_action="改用本地文件/已有上下文，或先配置 BOCHA_API_KEY 后再搜索",
+            )
 
         try:
             # 使用异步 HTTP 客户端发送搜索请求（POST 方法）
@@ -159,23 +167,38 @@ class WebSearchTool(Tool):
             ]
             return _format_results(query, items, n)
         except Exception as e:
-            return f"错误：bocha 搜索失败: {e}"
+            return format_tool_error(
+                f"bocha 搜索失败：{e}",
+                attempted=f"搜索：{query}",
+                do_not_repeat="不要用完全相同的 query 反复调用 web_search",
+                next_action="换成更具体的关键词，减少 count，或改用已有 URL 直接 web_fetch",
+            )
 
     
 
 class WebFetchTool(Tool):
     """网页抓取工具"""
 
+    def __init__(self, max_chars: int = 50000, proxy: str | None = None):
+        """初始化网页抓取返回长度和代理地址。"""
+        # 最大返回字符数
+        self.max_chars = max_chars
+        # HTTP 代理地址
+        self.proxy = proxy
+
     @property
     def name(self) -> str:
+        """返回网页抓取工具名称。"""
         return "web_fetch"
     
     @property
     def description(self) -> str:
+        """返回网页抓取工具说明。"""
         return "抓取指定 URL 的内容，支持 HTML 正文提取和 JSON 格式化。"
     
     @property
     def parameters(self) -> dict[str, Any]:
+        """返回网页抓取工具参数 Schema。"""
         return {
             "type": "object",
             "properties": {
@@ -185,23 +208,24 @@ class WebFetchTool(Tool):
             },
             "required": ["url"],
         }
-        
-    def __init__(self, max_chars: int = 50000, proxy: str | None = None):
-        # 最大返回字符数
-        self.max_chars = max_chars
-        # HTTP 代理地址
-        self.proxy = proxy
 
     async def execute(self,  **kwargs: Any) -> str:
+        """校验 URL 后抓取网页内容。"""
         # 使用参数或默认值
         max_chars = kwargs.get("maxChars") or self.max_chars
         # 验证 URL 合法性
-        is_valid, error_msg = _validate_url(kwargs.get("url") or "")
+        url = kwargs.get("url") or ""
+        is_valid, error_msg = _validate_url(url)
         if not is_valid:
-            return f"错误：url不合法 ({error_msg})."
+            return format_tool_error(
+                f"url 不合法（{error_msg}）",
+                attempted=f"抓取 URL：{url}",
+                do_not_repeat="不要用相同 URL 再次调用 web_fetch",
+                next_action="提供完整 http/https URL；如果只有关键词，请先用 web_search 查找候选页面",
+            )
 
         # 执行抓取
-        return await self._fetch(kwargs.get("url") or "", kwargs.get("extractMode") or "markdown", max_chars)
+        return await self._fetch(url, kwargs.get("extractMode") or "markdown", max_chars)
 
     async def _fetch(self, url: str, extract_mode: str, max_chars: int) -> str:
         """抓取网页内容"""
@@ -237,9 +261,20 @@ class WebFetchTool(Tool):
 
             return f"Content from {str(r.url)}:\n\n{text}"
         except httpx.HTTPStatusError as e:
-            return f"错误：HTTP 状态码 {e.response.status_code}。"
+            return format_tool_error(
+                f"HTTP 状态码 {e.response.status_code}",
+                attempted=f"抓取 URL：{url}",
+                observed=f"最终 URL：{e.response.url}",
+                do_not_repeat="不要用相同 URL 反复调用 web_fetch",
+                next_action="如果是 404/403，请改用 web_search 查找可访问来源；如果是临时错误，稍后再试",
+            )
         except Exception as e:
-            return f"错误：抓取网页失败 ({e})。"
+            return format_tool_error(
+                f"抓取网页失败：{e}",
+                attempted=f"抓取 URL：{url}",
+                do_not_repeat="不要用相同 URL 和参数反复调用 web_fetch",
+                next_action="先用 web_search 查找替代页面，或降低 maxChars/切换 extractMode 后再判断是否需要重试",
+            )
 
     def _extract_html_content(self, html_text: str, extract_mode: str) -> str:
         """从 HTML 中提取正文"""

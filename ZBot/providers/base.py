@@ -12,6 +12,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
 
+DEFAULT_CONTEXT_WINDOW = 128_000
+
 
 @dataclass
 class ToolCallRequest:
@@ -42,8 +44,28 @@ class LLMProvider(ABC):
     """LLM 提供商抽象基类。"""
 
     def __init__(self, api_key: str | None = None, api_base: str | None = None):
+        """初始化通用 LLM 提供商认证和地址配置。"""
         self.api_key = api_key
         self.api_base = api_base
+
+    @abstractmethod
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning_effort: str | None = None,
+    ) -> LLMResponse:
+        """发送聊天请求并返回标准化响应。"""
+        raise NotImplementedError
+
+
+    def get_context_window(self, model: str | None = None) -> int:
+        """返回模型上下文窗口大小，查不到时使用现代模型的保守默认值。"""
+        return DEFAULT_CONTEXT_WINDOW
+
 
     @staticmethod
     def _sanitize_empty_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -91,16 +113,3 @@ class LLMProvider(ABC):
                 clean["content"] = ""
             sanitized.append(clean)
         return sanitized
-
-    @abstractmethod
-    async def chat(
-        self,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None = None,
-        model: str | None = None,
-        max_tokens: int = 4096,
-        temperature: float = 0.7,
-        reasoning_effort: str | None = None,
-    ) -> LLMResponse:
-        """发送聊天请求并返回标准化响应。"""
-        raise NotImplementedError

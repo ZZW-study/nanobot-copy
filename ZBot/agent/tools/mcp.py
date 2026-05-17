@@ -23,7 +23,7 @@ from typing import Any
 import httpx
 
 from loguru import logger
-from ZBot.agent.tools.base import Tool
+from ZBot.agent.tools.base import Tool, format_tool_error
 from ZBot.agent.tools.registry import ToolRegistry
 from mcp import ClientSession
 
@@ -50,14 +50,17 @@ class MCPToolWrapper(Tool):
 
     @property
     def name(self) -> str:
+        """返回 MCP 工具名称。"""
         return self._name
 
     @property
     def description(self) -> str:
+        """返回 MCP 工具说明。"""
         return self._description
 
     @property
     def parameters(self) -> dict[str, Any]:
+        """返回 MCP 工具参数 Schema。"""
         return self._parameters
 
     # ========================================================================
@@ -90,7 +93,13 @@ class MCPToolWrapper(Tool):
             )
         except asyncio.TimeoutError:
             logger.warning("MCP 工具 '{}' 调用超时（{} 秒）", self._name, self._tool_timeout)
-            return f"（MCP 工具调用超时：{self._tool_timeout} 秒）"
+            return format_tool_error(
+                f"MCP 工具调用超时：{self._tool_timeout} 秒",
+                attempted=f"调用 MCP 工具 {self._name}，参数：{kwargs}",
+                observed="等待远程 MCP 服务返回结果时超过工具超时阈值",
+                do_not_repeat="不要用相同参数立刻重复调用该 MCP 工具",
+                next_action="缩小输入范围、换用本地工具或其他 MCP 工具；如果必须重试，请先调整参数",
+            )
 
         # ---------------------- 异常情况: 其他所有错误 ----------------------
         except Exception as exc:
@@ -100,7 +109,13 @@ class MCPToolWrapper(Tool):
                 type(exc).__name__,  # 异常类型，如 ValueError、ConnectionError 等
                 exc,                 # 异常消息
             )
-            return f"（MCP 工具调用失败:{type(exc).__name__}）"
+            return format_tool_error(
+                f"MCP 工具调用失败：{type(exc).__name__}",
+                attempted=f"调用 MCP 工具 {self._name}，参数：{kwargs}",
+                observed=str(exc) or "异常没有返回详细消息",
+                do_not_repeat="不要用相同参数重复调用该 MCP 工具",
+                next_action="根据异常信息调整参数，或改用其他工具获取同类信息",
+            )
 
         # ==================== 解析 MCP 工具返回结果 ====================
         # result.content 是一个列表，每元素是一块内容 (ContentBlock)
@@ -164,6 +179,7 @@ async def connect_mcp_servers(
                     timeout: httpx.Timeout | None = None,
                     auth: httpx.Auth | None = None,
                 ) -> httpx.AsyncClient:
+                    """创建合并配置头信息的 SSE HTTP 客户端。"""
                     # 合并两层 headers: 先 (cfg.headers)，后(SDK 自带的)
                     merged_headers = {**(cfg.headers or {}), **(headers or {})}
                     # 创建异步 HTTP 客户端实例

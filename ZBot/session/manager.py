@@ -44,27 +44,26 @@ class Session:
     memory_snapshot: str | None = None                              # 记忆快照（归档时保存的摘要信息）
 
 
-    def get_history(self, max_messages: int = 25) -> list[dict[str, Any]]:
-        """返回历史消息列表（用于构造模型上下文）。"""
-        # 从上次归档位置到末尾，再取最近的 max_messages 条
-        messages = self.messages[self.last_consolidated :][-max_messages:]
+    def get_history_by_token_budget(self, token_budget: int) -> list[dict[str, Any]]:
+        """按 token 预算返回最近历史，避免固定消息条数误判上下文大小。"""
+        messages = self.messages[self.last_consolidated :]
+        if not messages:
+            return []
 
-        # 找到第一条 user 消息的位置,  next(..., None)：取生成器的第一个结果；没找到就返回 None，不抛异常。--生成器表达式，生成器函数
-        first_user = next((index for index, message in enumerate(messages) if message.get("role") == "user"), None)
-        if first_user is not None:
-            # 从第一条 user 消息开始截断
-            messages = messages[first_user:]
+        selected: list[dict[str, Any]] = []
+        used_tokens = 0
+        for message in reversed(messages):
+            cost = self._estimate_message_tokens(message)
+            if selected and used_tokens + cost > token_budget:
+                break
+            selected.append(message)
+            used_tokens += cost
 
-        history: list[dict[str, Any]] = []
-        for message in messages:
-            # 构造标准格式的消息条目
-            entry = {"role": message["role"], "content": message.get("content", "")}
-            # 额外保留特殊字段（如工具调用信息）
-            for f in _HISTORY_FIELDS:
-                if f in message:
-                    entry[f] = message[f]
-            history.append(entry)
-        return history
+        selected.reverse()
+        selected = self._trim_to_first_user(selected)
+        selected = self._drop_unpaired_tool_prefix(selected)
+        return [self._history_entry(message) for message in selected]
+
 
     def clear(self) -> None:
         """清空会话。"""
@@ -72,6 +71,38 @@ class Session:
         self.last_consolidated = 0
         self.updated_at = datetime.now()
         self.memory_snapshot = None
+
+    @staticmethod
+    def _estimate_message_tokens(message: dict[str, Any]) -> int:
+        """粗略估算单条消息 token，和 Agent loop 的轻量估算保持同一思路。"""
+        total_chars = len(str(message.get("role", ""))) + len(str(message.get("content", "")))
+        if "tool_calls" in message:
+            total_chars += len(json.dumps(message["tool_calls"], ensure_ascii=False))
+        if "tool_call_id" in message:
+            total_chars += len(str(message["tool_call_id"]))
+        return max(1, total_chars // 2)
+
+    @staticmethod
+    def _trim_to_first_user(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """历史上下文从第一条 user 消息开始，避免 assistant/tool 无来源地开头。"""
+        first_user = next((index for index, message in enumerate(messages) if message.get("role") == "user"), None)
+        return messages[first_user:] if first_user is not None else messages
+
+    @staticmethod
+    def _drop_unpaired_tool_prefix(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """去掉开头没有 assistant tool_call 配对的 tool 消息，保持协议合法。"""
+        while messages and messages[0].get("role") == "tool":
+            messages = messages[1:]
+        return messages
+
+    @staticmethod
+    def _history_entry(message: dict[str, Any]) -> dict[str, Any]:
+        """构造发给模型的历史消息，只保留标准字段和必要工具链字段。"""
+        entry = {"role": message["role"], "content": message.get("content", "")}
+        for field_name in _HISTORY_FIELDS:
+            if field_name in message:
+                entry[field_name] = message[field_name]
+        return entry
 
 
 class SessionManager:
@@ -110,6 +141,7 @@ class SessionManager:
         #   3. 主协程 await 等待线程完成，期间事件循环可处理其他协程
         #   4. 线程完成后返回结果，主协程继续执行
         def write_file():
+            """在线程池中把会话内容追加写入磁盘。"""
             with open(path, mode="a", encoding="utf-8") as f:
                 f.write("\n".join(lines) + "\n")
         await asyncio.to_thread(write_file)

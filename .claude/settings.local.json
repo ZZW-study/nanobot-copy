@@ -1,13 +1,50 @@
 {
   "permissions": {
     "allow": [
+      // 语法检查：编译 context.py 看有没有语法错误
       "Bash(python -m py_compile ZBot/agent/context.py)",
+
+      // 直接启动 Python（可能是交互式调试用）
       "Bash(python)",
+
+      // 语法检查：编译 skills.py 看有没有语法错误
       "Bash(python -m py_compile ZBot/agent/skills.py)",
+
+      // 以"警告当异常"模式导入 shell 模块，检测 deprecation warning
       "Bash(python -W error -c \"import ZBot.agent.tools.shell\")",
+
+      // 同上，更详细的版本，额外打印确认信息
       "Bash(python -c \"import warnings; warnings.filterwarnings\\('error'\\); import ZBot.agent.tools.shell; print\\('No warnings'\\)\")",
+
+      // 测试 Config schema 能否正常实例化
       "Bash(python -c \"from ZBot.config.schema import Config; c = Config\\(temperature=0.5, max_tokens=4096, memory_window=25\\); print\\('schema OK'\\)\")",
-      "Bash(python -c \"from ZBot.agent.loop import AgentLoop; print\\('loop OK'\\)\")"
+
+      // 测试 AgentLoop 模块能否正常导入
+      "Bash(python -c \"from ZBot.agent.loop import AgentLoop; print\\('loop OK'\\)\")",
+
+      // 探索 interpreters 模块的成员列表
+      "Bash(python -c \"import interpreters; print\\(dir\\(interpreters\\)\\)\")",
+
+      // 探探索 _interpreters 内部模块的成员列表
+      "Bash(python -c \"import _interpreters; print\\(dir\\(_interpreters\\)\\)\")",
+
+      // 允许 uv run 执行任意命令（通配符，最宽松）
+      "Bash(uv run *)",
+
+      // 以下多条都是调试 uv python list，试了不同路径格式（WSL/Windows 混合环境）
+      "Bash(cmd.exe /c \"cd /d e:\\\\LLMsApplicationDevelopment\\\\ZBot && uv python list 2>&1 | head -30\")",
+      "Bash(cmd.exe /c \"uv --version 2>&1\")",
+      "Bash(\"/c/Windows/System32/cmd.exe\" /c \"cd /d e:\\\\LLMsApplicationDevelopment\\\\ZBot && uv python list 2>&1\")",
+      "Bash(\"/mnt/c/Windows/System32/cmd.exe\" /c \"cd /d e:\\\\LLMsApplicationDevelopment\\\\ZBot && uv python list 2>&1\")",
+      "Bash(\"/c/Windows/System32/cmd.exe\" /c \"uv python list 2>&1\")",
+      "Bash(\"/c/Windows/System32/cmd.exe\" /c \"uv python list > C:\\\\temp\\\\pylist.txt 2>&1\")",
+      "Bash(\"/c/Windows/System32/cmd.exe\" /c \"uv python list --output-format json > C:/temp/pylist.json 2>&1 && type C:/temp/pylist.json\")",
+
+      // 用项目虚拟环境的 Python 执行检查脚本
+      "Bash(\"e:/LLMsApplicationDevelopment/ZBot/.venv/Scripts/python.exe\" \"e:/LLMsApplicationDevelopment/ZBot/check_py.py\")",
+
+      // 检查 uv 是否在系统 PATH 中
+      "Bash(\"e:/LLMsApplicationDevelopment/ZBot/.venv/Scripts/python.exe\" -c \"import shutil; print\\(shutil.which\\('uv'\\)\\)\")"
     ]
   }
 }
